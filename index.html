@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>设定工作台</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div id="app">
+  <div class="brand" id="brand">
+    <span class="dot"></span>
+    <span class="name" id="brandName">设定工作台</span>
+    <span class="sub" id="brandSub"></span>
+  </div>
+
+  <div class="topbar">
+    <div class="crumb" id="crumb">概览</div>
+    <button class="tab on" data-view="dash">概览</button>
+    <button class="tab" data-view="doc">文档</button>
+    <button class="tab" data-view="settings">设置</button>
+    <button class="tab" id="aiToggle">AI 改写</button>
+  </div>
+
+  <aside class="tree" id="tree"></aside>
+  <main class="main" id="main"></main>
+</div>
+
+<aside class="ai-panel" id="aiPanel">
+  <div class="ai-head">
+    <span class="t">AI 改写</span>
+    <span class="loc" id="aiLoc"></span>
+    <button class="x" id="aiClose" title="关闭">×</button>
+  </div>
+  <div class="ai-body" id="aiBody"></div>
+</aside>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
