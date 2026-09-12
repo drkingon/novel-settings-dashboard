@@ -905,7 +905,74 @@ table.md .rowtools button:hover { background: var(--bg-hover); color: var(--acce
 /* 区块 */
 .wd-sec { padding: 14px 22px; border-bottom: 1px solid var(--border-soft); display: flex; flex-direction: column; min-height: 0; }
 .wd-sec.grow { flex: 1 1 auto; border-bottom: none; }
-.wd-sh { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; }
+.wd-sh { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; flex-wrap: wrap; }
+.wd-sh .model-pick.agent-model { width: auto; margin-top: 0; padding-top: 5px; padding-bottom: 5px; }
+.wd-sh { position: relative; }
+
+/* 交给助手 · 弹出菜单 */
+.wd-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  width: 320px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, .45);
+  padding: 12px 14px;
+}
+.wd-pop-t { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; letter-spacing: .04em; }
+.wd-pop-i {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--text-dim);
+  padding: 6px 8px; border-radius: 7px; cursor: pointer;
+}
+.wd-pop-i:hover { background: var(--bg-hover); }
+.wd-pop-i input[type="radio"] { accent-color: var(--accent); }
+.wd-pop-hint { font-size: 11px; color: var(--text-faint); line-height: 1.6; margin: 8px 0; padding: 6px 8px; background: var(--bg); border-radius: 7px; }
+.wd-pop-sep { font-size: 11px; color: var(--text-faint); margin: 10px 0 6px; padding-top: 9px; border-top: 1px solid var(--border-soft); letter-spacing: .03em; }
+.wd-num {
+  width: 84px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font: 12px/1.5 var(--mono);
+  padding: 5px 8px;
+  outline: none;
+  font-variant-numeric: tabular-nums;
+}
+.wd-num:focus { border-color: var(--accent-line); }
+.wd-pop-btns { display: flex; gap: 8px; margin: 8px 0 6px; }
+.wd-pop-btns .btn { flex: 1; }
+.wd-pop-foot { font-size: 10.5px; color: var(--text-faint); line-height: 1.5; }
+
+/* 执行进度视窗 */
+.wd-runlog {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  height: 150px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  font: 11.5px/1.7 var(--mono);
+  color: var(--text-dim);
+}
+.wd-runline { white-space: pre-wrap; word-break: break-all; }
+.wd-runline:first-child { color: var(--text-faint); }
+
+/* 任务队列面板 */
+.wd-queue { display: flex; flex-direction: column; gap: 4px; max-height: 110px; overflow-y: auto; }
+.wd-qline { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--text-dim); }
+.wd-qico { flex-shrink: 0; }
+.wd-qtxt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wd-qempty { font-size: 11.5px; color: var(--text-faint); }
+.wd-qstale {
+  margin-top: 6px; font-size: 11px; color: #e8a99e;
+  background: rgba(232, 169, 158, .08); border: 1px solid rgba(232, 169, 158, .25);
+  border-radius: 7px; padding: 6px 8px; line-height: 1.5;
+}
 .wd-sh .lbl { font-size: 12px; font-weight: 600; color: var(--text); letter-spacing: .04em; }
 .wd-sh .hint { font-size: 11px; color: var(--text-faint); }
 .wd-sh .sp { flex: 1; }

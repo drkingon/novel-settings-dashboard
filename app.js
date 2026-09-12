@@ -74,6 +74,74 @@ async function api(path, options) {
   return data;
 }
 
+/**
+ * 流式生成（POST /api/ai/raw/stream，SSE）。
+ * 服务端策略：只要模型还在持续吐字就不算超时（首字给 5 分钟、之后连续 3 分钟无新字才判卡死），
+ * 因此长文生成不会像旧的固定 240s 墙钟那样被误判失败；
+ * 真的中断了也会把已生成的内容回传（done.partial=true），不会整段丢稿。
+ * @returns {Promise<{text:string, chars?:number, elapsed?:number, partial?:boolean, note?:string, resultPath?:string}>}
+ */
+async function streamRawGenerate({ prompt, temperature = 0.85, max_tokens = 4096, path = "", onText, onStatus, onTick, onDone }) {
+  // 在线版（GitHub 模式）直接从静态页打开，没有本地服务端；
+  // 本地服务没起来或版本较旧时也一样。这些情况退回「浏览器直连模型」，
+  // 虽然拿不到逐字流式，但功能不会直接报 404 挂掉。
+  const directCall = async (why) => {
+    if (onStatus) onStatus(why);
+    const { candidates } = await source().aiRewrite({
+      text: prompt,
+      instruction: "按上面的完整要求执行并只输出成果本身。",
+      context: {},
+      count: 1,
+    });
+    const text = (candidates && candidates[0]) || "";
+    if (onText) onText(text, text);
+    const res = { text, chars: text.length, partial: false, fallback: true };
+    if (onDone) onDone(res, text);
+    return res;
+  };
+  if (activeMode === "github") return await directCall("在线版：改用浏览器直连模型（无逐字进度）");
+
+  let resp;
+  try {
+    resp = await fetch("/api/ai/raw/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, temperature, max_tokens, ...(path ? { path } : {}) }),
+    });
+  } catch (err) {
+    return await directCall(`本地服务不可用（${err.message}），改用浏览器直连模型`);
+  }
+  if (resp.status === 404) return await directCall("本地服务版本较旧（缺少 /api/ai/raw/stream），改用浏览器直连模型");
+  if (!resp.ok || !resp.body) {
+    const d = await resp.json().catch(() => ({}));
+    throw new Error(d.error || `HTTP ${resp.status}`);
+  }
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", acc = "", outcome = null, failed = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+      const line = frame.split("\n").find((l) => l.startsWith("data: "));
+      if (!line) continue;
+      let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+      if (ev.type === "status") { if (onStatus) onStatus(ev.data); }
+      else if (ev.type === "text") { acc += ev.data; if (onText) onText(ev.data, acc); }
+      else if (ev.type === "tick") { if (onTick) onTick(ev.data || {}); }
+      else if (ev.type === "done") { outcome = ev.data || {}; }
+      else if (ev.type === "error") { failed = (ev.data && ev.data.note) || "未知错误"; }
+    }
+  }
+  if (failed) throw new Error(failed);
+  const text = (outcome && outcome.content) || acc;
+  if (onDone) onDone(outcome || {}, text);
+  return { text, ...(outcome || {}) };
+}
+
 function b64encode(str) {
   const bytes = new TextEncoder().encode(str);
   let bin = "";
@@ -168,7 +236,7 @@ const LocalSource = {
   },
   async aiConfig() {
     const c = await api("/api/ai/config");
-    return { baseUrl: c.baseUrl, model: c.model, hasKey: c.hasKey, keyMask: c.keyMask };
+    return { baseUrl: c.baseUrl, model: c.model, hasKey: c.hasKey, keyMask: c.keyMask, autoUnload: c.autoUnload };
   },
   async saveAiConfig(cfg) {
     const c = await api("/api/ai/config", {
@@ -176,7 +244,7 @@ const LocalSource = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cfg),
     });
-    return { baseUrl: c.baseUrl, model: c.model, hasKey: c.hasKey, keyMask: c.keyMask };
+    return { baseUrl: c.baseUrl, model: c.model, hasKey: c.hasKey, keyMask: c.keyMask, autoUnload: c.autoUnload };
   },
   async aiRewrite(payload) { return api("/api/ai/rewrite", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); },
   async aiPipeline(payload) { return api("/api/ai/pipeline", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); },
@@ -725,11 +793,14 @@ function renderTree() {
         walk(n.children, depth + 1);
       } else {
         const on = n.path === state.currentPath ? " on" : "";
-        const kb = n.size ? `${Math.max(1, Math.round(n.size / 1024))}k` : "";
+        const isDraft = /^正文\//.test(n.path);
+        const meta = (isDraft && typeof n.chars === "number")
+          ? `${n.chars} 字`
+          : (n.size ? `${Math.max(1, Math.round(n.size / 1024))}k` : "");
         html.push(`<div class="item${on}" data-path="${escapeHtml(n.path)}" style="padding-left:${10 + depth * 10}px">
           <span class="mark"></span>
           <span style="overflow:hidden;text-overflow:ellipsis">${fileIcon(n.name)} ${escapeHtml(n.name)}</span>
-          <span class="meta">${kb}</span>
+          <span class="meta">${meta}</span>
         </div>`);
       }
     }
@@ -850,11 +921,12 @@ async function openFile(path) {
 
 function renderDoc() {
   const m = $("#main");
+  const docChars = (state.content || "").replace(/\s/g, "").length;
   const html = [`<div class="doc">
     <div class="doc-head">
       <span class="p">${escapeHtml(state.currentPath)}</span>
       <span class="act">
-        <span style="font-size:11px;color:var(--text-faint)">${state.blocks.length} 块</span>
+        <span style="font-size:11px;color:var(--text-faint)">${state.blocks.length} 块 · <b style="color:var(--accent)">${docChars}</b> 字</span>
         <button class="mini" id="reloadBtn">重新载入</button>
       </span>
     </div>`];
@@ -1478,8 +1550,8 @@ function renderWritingUI() {
       </div>
 
       <div class="w-note">
-        <b>创作流程</b>：点任一章的 <b>「创作 ›」</b>（或展开后点「创作」）→ 右侧滑出<b>创作台</b>，里面按 oh-story 四步走：①出细纲 → ②写正文 → ③去 AI 味 → ④审查。<br>
-        创作台内可<b>粘贴我给你的 prompt</b>，也可点「打包」自动生成；执行方式两种：<b>生成本章</b>（本地模型直出）与<b>流水线</b>（webnovel 水版 → gemma 精简）。结果落在下方编辑区，<b>可直接手改</b>，⌘/Ctrl+S 保存。
+        <b>创作流程</b>：点任一章的 <b>「创作 ›」</b>（或展开后点「创作」）→ 右侧滑出<b>创作台</b>，按 oh-story 流程走：①出细纲 → ②写正文 → <b>③扩写</b>（不足字数时分块扩写）→ ④去 AI 味 → ⑤审查。<br>
+        创作台内可<b>粘贴我给你的 prompt</b>，也可点「打包」自动生成；执行方式：<b>生成本章</b>（当前配置模型直出）、<b>流水线</b>（水版 → 精简）、<b>交给助手</b>（弹出菜单：立即执行＝API 流式实时出字并落盘 / 加入队列＝整点由助手执行）。结果落在下方编辑区，<b>可直接手改</b>，⌘/Ctrl+S 保存。
       </div>
 
       <div class="ch-list">${rows}</div>
@@ -1548,9 +1620,19 @@ function renderChapterDetail(ch) {
 const WRITING_STEPS = [
   { key: "outline", n: "①", name: "出细纲" },
   { key: "draft", n: "②", name: "写正文" },
-  { key: "deslop", n: "③", name: "去 AI 味" },
-  { key: "review", n: "④", name: "审查" },
+  { key: "expand", n: "③", name: "扩写" },
+  { key: "deslop", n: "④", name: "去 AI 味" },
+  { key: "review", n: "⑤", name: "审查" },
 ];
+
+/** 各任务的编辑器标题 */
+function taskLabel(t) {
+  if (t === "outline") return "细纲";
+  if (t === "review") return "审查报告";
+  if (t === "deslop") return "改稿";
+  if (t === "expand") return "正文（扩写）";
+  return "正文";
+}
 
 /** 各任务的默认落盘路径 */
 function drawerSavePath(ch, task) {
@@ -1613,12 +1695,45 @@ async function openWritingDrawer(ch, task = "draft") {
         <span class="sp"></span>
         <button class="btn primary" id="wdRun" ${aiReady() ? "" : "disabled"}>生成本章</button>
         <button class="btn" id="wdPipe" ${aiReady() && task === "draft" ? "" : "disabled"}>流水线（水版→精简）</button>
+        ${activeMode === "github" ? "" : `<button class="btn" id="wdAgent">交给助手 ▾</button>
+        <div class="wd-pop" id="wdAgentPop" hidden>
+          <div class="wd-pop-t">立即执行（API 流式）</div>
+          <div class="wd-pop-hint" id="wdApiHint">检测模型配置…</div>
+          <div class="wd-pop-btns">
+            <button class="btn primary" id="wdStreamNow">立即执行（流式）</button>
+          </div>
+          <div class="wd-pop-sep">或交给队列（整点扫描）</div>
+          <label class="wd-pop-i"><input type="radio" name="wdm" value="default">默认（跟随 WorkBuddy 当前模型）</label>
+          <label class="wd-pop-i"><input type="radio" name="wdm" value="lite">快速（lite，省而快）</label>
+          <label class="wd-pop-i"><input type="radio" name="wdm" value="reasoning">深度推理（reasoning，适合正文）</label>
+          <div class="wd-pop-btns">
+            <button class="btn" id="wdQueueIt">加入队列（整点）</button>
+          </div>
+          <div class="wd-pop-foot" id="wdCliHint">检测本机 CLI 执行器…</div>
+        </div>`}
       </div>
+    </section>
+
+    <section class="wd-sec" id="wdExpandBox" ${task === "expand" ? "" : "hidden"}>
+      <div class="wd-sh">
+        <span class="lbl">扩写</span>
+        <span class="hint">按块扩写编辑区里的文本，情节不变、只做展开</span>
+        <span class="sp"></span>
+        <span class="hint">目标</span>
+        <input id="wdExpandTarget" class="wd-num" type="number" min="300" max="30000" step="100" value="${Number(config.expandTarget) || 4000}" title="目标字数（非空白字符）" />
+        <span class="hint">字</span>
+        <button class="btn primary" id="wdExpandRun">开始扩写（流式）</button>
+      </div>
+    </section>
+
+    <section class="wd-sec" id="wdRunBox" hidden>
+      <div class="wd-sh"><span class="lbl">执行进度</span><span class="hint" id="wdRunState">…</span><span class="sp"></span><span class="wc" id="wdRunChars">0 字</span></div>
+      <div class="wd-runlog" id="wdRunLog"></div>
     </section>
 
     <section class="wd-sec grow">
       <div class="wd-sh">
-        <span class="lbl" id="wdEdLabel">${task === "outline" ? "细纲" : task === "review" ? "审查报告" : task === "deslop" ? "改稿" : "正文"}</span>
+        <span class="lbl" id="wdEdLabel">${taskLabel(task)}</span>
         <span class="hint">直接编辑；⌘/Ctrl+S 保存</span>
         <span class="sp"></span>
         <span class="wc" id="wdCount">0 字</span>
@@ -1629,8 +1744,13 @@ async function openWritingDrawer(ch, task = "draft") {
       <textarea id="wdEditor" class="wd-editor" spellcheck="false" placeholder="生成结果会出现在这里，也可以直接手写…"></textarea>
     </section>
 
+    <section class="wd-sec" id="wdQueueBox">
+      <div class="wd-sh"><span class="lbl">任务队列</span><span class="hint">整点扫描 · 约 8 秒刷新</span><span class="sp"></span><button class="mini" id="wdQueueRefresh">刷新</button></div>
+      <div class="wd-queue" id="wdQueueList"></div>
+    </section>
+
     <footer class="wd-foot">
-      <input id="wdPath" class="wd-path" value="${escapeHtml(drawerSavePath(ch, task))}" />
+      <input id="wdPath" class="wd-path" value="${escapeHtml(drawerSavePath(ch, task))}" onfocus="this.select()" />
       <button class="btn primary" id="wdSave">保存</button>
       <span class="wd-status" id="wdStatus"></span>
     </footer>
@@ -1687,6 +1807,10 @@ async function openWritingDrawer(ch, task = "draft") {
     q("#wdPath").value = drawerSavePath(ch, t);
     promptEl.value = "";
     setStatus("");
+    const expandBoxEl = q("#wdExpandBox");
+    if (expandBoxEl) expandBoxEl.hidden = t !== "expand";
+    const edLabelEl = q("#wdEdLabel");
+    if (edLabelEl) edLabelEl.textContent = taskLabel(t);
     await loadEditorForTask(t);
   };
 
@@ -1694,28 +1818,66 @@ async function openWritingDrawer(ch, task = "draft") {
     const p = promptEl.value.trim();
     if (!p) { setStatus("先粘贴或打包一个 prompt", true); return; }
     const btn = mode === "pipe" ? q("#wdPipe") : q("#wdRun");
+    const runBox = q("#wdRunBox"), runLog = q("#wdRunLog"), runState = q("#wdRunState"), runChars = q("#wdRunChars");
+    const log = (t) => {
+      if (!runLog) return;
+      const d = document.createElement("div");
+      d.className = "wd-runline"; d.textContent = t;
+      runLog.appendChild(d);
+      while (runLog.children.length > 60) runLog.firstChild.remove();
+      runLog.scrollTop = runLog.scrollHeight;
+    };
+    const before = editorEl.value;   // 生成前内容：用于快照保护 + 流式期间拼接展示
+    if (before.trim()) { genSnapshot = before; q("#wdRestore").hidden = false; }
     btn.disabled = true;
-    setStatus(mode === "pipe" ? "流水线：WebNovel 写水版 → Gemma 精简…" : "本地模型生成中（冷启动约 40 秒）…");
+    if (runBox) { runBox.hidden = false; if (runLog) runLog.innerHTML = ""; }
+    if (runChars) runChars.textContent = "0 字";
     try {
-      let out = "";
+      let out = "", partialNote = "";
       if (mode === "pipe") {
+        if (runState) runState.textContent = "流水线：WebNovel 写水版 → Gemma 精简…";
+        setStatus("流水线：WebNovel 写水版 → Gemma 精简…");
         const r = await runPipeline({ text: p, instruction: "本阶段是水版，请充分铺开、先求完整有料。", context: {} });
         out = r.final || r.draft || "";
         if (r.draft) promptEl.dataset.water = r.draft;
       } else {
-        const d = await api("/api/ai/raw", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: p, temperature: 0.85, max_tokens: 4096 }) });
-        out = String(d.content || "");
+        // 流式：边生成边填编辑器，看得见活着；中断也保住已生成的字
+        if (runState) runState.textContent = "流式生成中（持续吐字即正常，不再按总时长判超时）…";
+        setStatus("流式生成中…");
+        let lastPaint = 0;
+        const r = await streamRawGenerate({
+          prompt: p,
+          temperature: 0.85,
+          max_tokens: 4096,
+          path: q("#wdPath") ? q("#wdPath").value.trim() : drawerSavePath(ch, curTask),
+          onText: (_d, acc) => {
+            editorEl.value = before.trim() ? `${before}\n\n${acc}` : acc;
+            updCount();
+            const now = Date.now();
+            if (now - lastPaint > 400) { lastPaint = now; if (runChars) runChars.textContent = `${acc.length} 字`; }
+          },
+          onStatus: (s) => { log(`▸ ${s}`); if (runState) runState.textContent = s; },
+          onTick: (t) => { if (runChars) runChars.textContent = `${(t && t.chars) || 0} 字 · ${(t && t.elapsed) || 0}s`; },
+        });
+        out = r.text || "";
+        if (r.partial) { partialNote = r.note || "生成被中断，已保留部分内容"; log(`⚠ ${partialNote}`); }
       }
       if (!out) throw new Error("模型返回空内容");
-      if (editorEl.value.trim()) {       // 编辑器里已有内容 → 先存快照，防止手写内容丢失
-        genSnapshot = editorEl.value;
-        q("#wdRestore").hidden = false;
-      }
-      editorEl.value = out;
+      editorEl.value = out;   // 流式期间已实时填充，这里统一收口
       updCount();
-      setStatus(`生成完成（${out.length} 字）；原内容可点「恢复上次内容」还原`);
-      toast("已生成，可直接编辑后保存");
+      if (runChars) runChars.textContent = `${out.length} 字`;
+      if (partialNote) {
+        if (runState) runState.textContent = `已保留 ${out.length} 字（生成中断）`;
+        setStatus(`生成中断，已保留 ${out.length} 字；可直接编辑或重试`, true);
+        toast(`生成中断，已保留 ${out.length} 字`, true);
+      } else {
+        if (runState) runState.textContent = `完成（${out.length} 字）`;
+        setStatus(`生成完成（${out.length} 字）；原内容可点「恢复上次内容」还原`);
+        toast("已生成，可直接编辑后保存");
+      }
     } catch (err) {
+      if (runState) runState.textContent = `失败：${err.message}`;
+      log(`✗ ${err.message}`);
       setStatus(`失败：${err.message}`, true);
       toast(`生成失败：${err.message}`, true);
     } finally {
@@ -1728,6 +1890,7 @@ async function openWritingDrawer(ch, task = "draft") {
     if (editorEl.value.trim() && editorEl.value !== lastSaved) {
       if (!confirm("编辑器有未保存的内容，确定关闭并丢弃？")) return;
     }
+    if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }
     document.removeEventListener("keydown", esc);
     drawer.classList.add("out");
     setTimeout(() => drawer.remove(), 180);
@@ -1749,6 +1912,168 @@ async function openWritingDrawer(ch, task = "draft") {
   });
   q("#wdRun").addEventListener("click", () => run("single"));
   q("#wdPipe").addEventListener("click", () => run("pipe"));
+  const agentBtn = q("#wdAgent");
+  let queueTimer = null;
+  let refreshQueue = async () => {};   // 队列面板刷新（在 agent 块里赋值，供扩写等其它块复用）
+  if (agentBtn) {
+    const pop = q("#wdAgentPop");
+    const runBox = q("#wdRunBox"), runLog = q("#wdRunLog"), runState = q("#wdRunState"), runChars = q("#wdRunChars");
+    const addLog = (t) => {
+      if (!runLog) return;
+      const d = document.createElement("div");
+      d.className = "wd-runline"; d.textContent = t;
+      runLog.appendChild(d);
+      while (runLog.children.length > 60) runLog.firstChild.remove();
+      runLog.scrollTop = runLog.scrollHeight;
+    };
+
+    // 队列面板（8 秒轮询，抽屉关闭即停）
+    const qList = q("#wdQueueList");
+    refreshQueue = async function () {
+      if (!qList) return;
+      try {
+        const d = await api("/api/agent/queue");
+        const ico = { pending: "⏳", claimed: "🔄", done: "✅", failed: "❌" };
+        const stale = d.items.some((i) => i.status === "pending" && Date.now() - new Date(i.createdAt).getTime() > 75 * 60000);
+        qList.innerHTML = (d.items.length ? d.items.map((i) =>
+          `<div class="wd-qline"><span class="wd-qico">${ico[i.status] || "·"}</span><span class="wd-qtxt">第${i.chapter}章 ${escapeHtml(i.taskName || i.task || "")} · ${escapeHtml(i.model || "default")} · ${escapeHtml(i.status || "")}${i.resultPath ? ` · ${escapeHtml(i.resultPath)}` : ""}${i.status === "failed" && i.note ? ` · ${escapeHtml(String(i.note).slice(0, 60))}` : ""}</span></div>`
+        ).join("") : `<div class="wd-qempty">队列空</div>`)
+        + (stale ? `<div class="wd-qstale">⚠ 有任务排队超过 75 分钟：调度器疑似卡点，到对话里说「跑队列任务」可立即执行</div>` : "");
+      } catch { qList.innerHTML = `<div class="wd-qempty">队列不可用（本地服务未连）</div>`; }
+    };
+    q("#wdQueueRefresh").addEventListener("click", () => refreshQueue());
+    refreshQueue();
+    queueTimer = setInterval(refreshQueue, 8000);
+
+    // 弹窗：模型选择 + 执行器检测
+    const radios = pop.querySelectorAll('input[name="wdm"]');
+    radios.forEach((r) => {
+      r.checked = r.value === (config.agentModel || "default");
+      r.addEventListener("change", () => { config.agentModel = r.value; saveConfig(); });
+    });
+    const cliHint = pop.querySelector("#wdCliHint");
+    const apiHint = pop.querySelector("#wdApiHint");
+    const streamBtn = pop.querySelector("#wdStreamNow");
+    const refreshCli = async () => {
+      // 模型配置提示（用「设置」里的主模型）
+      const m = state.aiConfig?.model || config.ai.model || "";
+      const b = state.aiConfig?.baseUrl || config.ai.baseUrl || "";
+      apiHint.innerHTML = m
+        ? `使用当前配置的模型：<b>${escapeHtml(m)}</b>${isLocalUrl(b) ? "（本地/局域网端点）" : "（云端）"}；结果会实时写入下方编辑器并自动落盘`
+        : `尚未配置模型：到「设置 → AI 模型」填好地址与模型名后再用（也可用「加入队列」交给我）`;
+      streamBtn.disabled = !m;
+      // 本机 CLI 执行器（需自备，未预装）
+      cliHint.textContent = "检测本机 CLI 执行器…";
+      try {
+        const st = await api("/api/agent/status");
+        cliHint.innerHTML = st.cli?.ok
+          ? `本机 CLI 执行器：${escapeHtml(st.cli.name || "CLI")} ${escapeHtml(st.cli.version || "")}（可在 config.json 用 agent.args 自定义参数）`
+          : `未检测到本机 CLI 执行器（需自备账号，本项目不预装、不消耗第三方额度）`;
+      } catch { cliHint.textContent = ""; }
+    };
+    const togglePop = () => { pop.hidden = !pop.hidden; if (!pop.hidden) { refreshCli(); refreshQueue(); } };
+    agentBtn.addEventListener("click", (e) => { e.stopPropagation(); togglePop(); });
+    pop.addEventListener("click", (e) => e.stopPropagation());
+    document.addEventListener("click", (e) => { if (!pop.hidden && !pop.contains(e.target)) pop.hidden = true; });
+    const chosenModel = () => pop.querySelector('input[name="wdm"]:checked')?.value || "default";
+
+    // 加入队列
+    pop.querySelector("#wdQueueIt").addEventListener("click", async () => {
+      try {
+        await api("/api/agent/queue", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chapter: ch.no, task: curTask, instruction: "", model: chosenModel() }),
+        });
+        pop.hidden = true;
+        setStatus("已加入队列：整点扫描执行，成稿自动落盘");
+        toast("已加入助手队列");
+        refreshQueue();
+      } catch (err) {
+        setStatus(`投递失败：${err.message}`, true);
+        toast(`投递失败：${err.message}`, true);
+      }
+    });
+
+    // 立即执行（API 流式：用「设置」里已配置的模型实时生成）
+    pop.querySelector("#wdStreamNow").addEventListener("click", async () => {
+      pop.hidden = true;
+      runBox.hidden = false; runLog.innerHTML = "";
+      runState.textContent = "准备中…"; runChars.textContent = "0 字";
+      streamBtn.disabled = true; agentBtn.disabled = true;
+      try {
+        if (!promptEl.value.trim()) await pack();
+        const prompt = promptEl.value.trim();
+        if (!prompt) throw new Error("prompt 为空，先在抽屉里点「打包」");
+        const targetPath = q("#wdPath").value.trim() || drawerSavePath(ch, curTask);
+        const before = editorEl.value;
+        runState.textContent = "流式生成中…";
+        let acc = "", lastPaint = 0;
+
+        const resp = await fetch("/api/agent/stream", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chapter: ch.no, task: curTask, prompt, path: targetPath }),
+        });
+        if (!resp.ok || !resp.body) {
+          const d = await resp.json().catch(() => ({}));
+          throw new Error(d.error || `HTTP ${resp.status}`);
+        }
+        const reader = resp.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "", resultPath = "", failed = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf("\n\n")) >= 0) {
+            const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+            const line = frame.split("\n").find((l) => l.startsWith("data: "));
+            if (!line) continue;
+            let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+            if (ev.type === "status") { addLog(`▸ ${ev.data}`); runState.textContent = ev.data; }
+            else if (ev.type === "log") addLog(`… ${ev.data}`);
+            else if (ev.type === "tick") { runChars.textContent = `${ev.data?.chars ?? acc.length} 字 · ${ev.data?.elapsed ?? 0}s`; }
+            else if (ev.type === "text") {
+              acc += ev.data;
+              editorEl.value = (before.trim() ? before + "\n\n" : "") + acc;
+              updCount();
+              const now = Date.now();
+              if (now - lastPaint > 500) { lastPaint = now; runChars.textContent = `${acc.length} 字`; }
+            } else if (ev.type === "done") {
+              resultPath = ev.data?.resultPath || targetPath;
+              runState.textContent = `完成（${ev.data?.elapsed ?? "?"} 秒 · ${ev.data?.chars ?? acc.length} 字）`;
+            } else if (ev.type === "error") {
+              failed = ev.data?.note || "未知错误";
+              runState.textContent = `失败：${failed}`;
+            }
+          }
+        }
+        if (failed) throw new Error(failed);
+        runChars.textContent = `${acc.length} 字`;
+        if (acc) {
+          if (before.trim()) { genSnapshot = before; q("#wdRestore").hidden = false; }
+          editorEl.value = acc; lastSaved = acc; updCount();
+          const isOutline = /细纲/.test(resultPath);
+          const dBadge = q("#wdBadgeDraft"), oBadge = q("#wdBadgeOutline");
+          if (isOutline) { oBadge.className = "flag ok"; oBadge.textContent = "有细纲"; }
+          else { dBadge.className = "flag ok"; dBadge.textContent = "有正文"; }
+          q("#wdPath").value = resultPath;
+          addLog(`✓ 已落盘：${resultPath}`);
+          setStatus(`执行完成：${resultPath}`);
+          toast("生成完成，已实时写入并落盘");
+        }
+        await loadChapters(true);
+        renderWritingUI();
+      } catch (err) {
+        runState.textContent = `失败：${err.message}`;
+        addLog(`✗ ${err.message}`);
+        toast(`立即执行失败：${err.message}`, true);
+      } finally {
+        streamBtn.disabled = false; agentBtn.disabled = false;
+        refreshQueue();
+      }
+    });
+  }
   q("#wdLoad").addEventListener("click", async () => {
     const path = drawerSavePath(ch, curTask);
     try {
@@ -1798,6 +2123,86 @@ async function openWritingDrawer(ch, task = "draft") {
     } catch (err) {
       setStatus(`保存失败：${err.message}`, true);
       toast(`保存失败：${err.message}`, true);
+    }
+  });
+
+  // 扩写（分块扩写 + 流式进度）：把编辑区里的文本扩写到目标字数
+  const expandRunBtn = q("#wdExpandRun");
+  const expandTargetEl = q("#wdExpandTarget");
+  if (expandTargetEl) {
+    expandTargetEl.addEventListener("change", () => {
+      config.expandTarget = Math.max(300, Math.min(30000, Number(expandTargetEl.value) || 4000));
+      expandTargetEl.value = config.expandTarget;
+      saveConfig();
+    });
+  }
+  if (expandRunBtn) expandRunBtn.addEventListener("click", async () => {
+    const before = editorEl.value;
+    if (!before.trim()) { setStatus("先载入或生成正文，再扩写", true); return; }
+    const target = Math.max(300, Math.min(30000, Number(expandTargetEl?.value) || 4000));
+    const targetPath = q("#wdPath").value.trim() || drawerSavePath(ch, curTask);
+    runBox.hidden = false; runLog.innerHTML = "";
+    runState.textContent = "扩写准备中…";
+    runChars.textContent = `${before.replace(/\s/g, "").length} 字 → 目标 ${target}`;
+    expandRunBtn.disabled = true;
+    try {
+      const resp = await fetch("/api/ai/expand", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: before, targetChars: target, path: targetPath, chapter: ch.no, instruction: "" }),
+      });
+      if (!resp.ok || !resp.body) {
+        const d = await resp.json().catch(() => ({}));
+        throw new Error(d.error || `HTTP ${resp.status}`);
+      }
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "", resultPath = "", failed = "", finalChars = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+          const line = frame.split("\n").find((l) => l.startsWith("data: "));
+          if (!line) continue;
+          let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+          if (ev.type === "status") { addLog(`▸ ${ev.data}`); runState.textContent = ev.data; }
+          else if (ev.type === "log") addLog(`… ${ev.data}`);
+          else if (ev.type === "chunk") runState.textContent = `第 ${ev.data.pass} 轮 · 第 ${ev.data.index}/${ev.data.total} 块（本块 ${ev.data.cur} → 约 ${ev.data.aim} 字）`;
+          else if (ev.type === "text") addLog(`· ${ev.data}`);
+          else if (ev.type === "progress") { finalChars = ev.data.chars; runChars.textContent = `${ev.data.chars} 字 / 目标 ${ev.data.target}`; }
+          else if (ev.type === "done") {
+            resultPath = ev.data?.resultPath || targetPath;
+            finalChars = ev.data?.chars || finalChars;
+            runState.textContent = `完成：${ev.data?.fromChars} → ${ev.data?.chars} 字（${ev.data?.passes} 轮 · ${ev.data?.elapsed}s）`;
+          } else if (ev.type === "error") failed = ev.data?.note || "未知错误";
+        }
+      }
+      if (failed) throw new Error(failed);
+      runChars.textContent = `${finalChars} 字`;
+      try {
+        const f = await source().file(resultPath);
+        if (f?.content) {
+          if (before.trim()) { genSnapshot = before; q("#wdRestore").hidden = false; }
+          editorEl.value = f.content; lastSaved = f.content; updCount();
+        }
+      } catch {}
+      addLog(`✓ 已落盘：${resultPath}（原文件已备份为 .bak-时间戳）`);
+      const dBadge = q("#wdBadgeDraft");
+      dBadge.className = "flag ok"; dBadge.textContent = "有正文";
+      q("#wdPath").value = resultPath;
+      setStatus(`扩写完成：${finalChars} 字 · ${resultPath}`);
+      toast(`扩写完成（${finalChars} 字）`);
+      await loadChapters(true);
+      renderWritingUI();
+    } catch (err) {
+      runState.textContent = `失败：${err.message}`;
+      addLog(`✗ ${err.message}`);
+      toast(`扩写失败：${err.message}`, true);
+    } finally {
+      expandRunBtn.disabled = false;
+      refreshQueue();
     }
   });
 
@@ -2017,7 +2422,10 @@ function promptSaveTarget(ch, task) {
 
 /** Prompt 运行弹窗：本地精简版可直接用本地大模型执行；完整版可复制贴给 Agent */
 async function openPromptRunDialog(ch, task, fullPrompt) {
-  $("#pvOverlay")?.remove();
+  // 注意：本函数下方声明了局部 const $（作用域覆盖整个函数体），
+  // 此处必须用 document.querySelector；写成 $() 会命中「暂时性死区」而抛
+  // ReferenceError: Cannot access '$' before initialization（表现为「打包失败」）。
+  document.querySelector("#pvOverlay")?.remove();
   const t = RAW_PACK_TASKS[task];
   const savePath = promptSaveTarget(ch, task);
   let localPrompt;
@@ -2095,24 +2503,43 @@ async function openPromptRunDialog(ch, task, fullPrompt) {
   $("#pvRun").addEventListener("click", async () => {
     const btn = $("#pvRun");
     btn.disabled = true;
-    statusEl.innerHTML = '<span class="spinner"></span> 本地模型生成中…（首次冷启动约 40 秒）';
+    statusEl.innerHTML = '<span class="spinner"></span> 流式生成中…（持续吐字即正常，不再按总时长判超时）';
     $("#pvResult").hidden = true;
     try {
-      const data = await api("/api/ai/raw", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: promptEl.value, temperature: 0.85, max_tokens: 4096 }),
+      const pathEl = $("#pvPath");
+      const targetPath = pathEl ? pathEl.value.trim() : "";
+      let lastPaint = 0;
+      const r = await streamRawGenerate({
+        prompt: promptEl.value,
+        temperature: 0.85,
+        max_tokens: 4096,
+        path: targetPath,
+        onText: (_d, acc) => {
+          const now = Date.now();
+          if (now - lastPaint > 400) {
+            lastPaint = now;
+            statusEl.innerHTML = `<span class="spinner"></span> 生成中… ${acc.length} 字`;
+          }
+        },
+        onTick: (t) => {
+          statusEl.innerHTML = `<span class="spinner"></span> 生成中… ${(t && t.chars) || 0} 字 · ${(t && t.elapsed) || 0}s`;
+        },
       });
-      const out = String(data.content || "");
+      const out = String(r.text || "");
       if (!out) throw new Error("模型返回空内容");
       $("#pvRaw").textContent = out;
-      $("#pvResultTitle").textContent = "结果";
+      $("#pvResultTitle").textContent = r.partial ? "结果（生成中断，已保留部分内容）" : "结果";
       $("#pvCount").textContent = `${out.length} 字`;
       $("#pvDraftWrap").hidden = true;
       $("#pvCopyDraft").hidden = true;
       $("#pvResult").hidden = false;
-      statusEl.textContent = "";
-      toast("生成完成，请检查后保存或复制");
+      if (r.partial) {
+        statusEl.textContent = `已保留 ${out.length} 字（生成中断：${r.note || ""}）`;
+        toast(`生成中断，已保留 ${out.length} 字`, true);
+      } else {
+        statusEl.textContent = "";
+        toast("生成完成，请检查后保存或复制");
+      }
     } catch (err) {
       statusEl.textContent = `失败：${err.message}`;
       toast(`执行失败：${err.message}`, true);
@@ -2428,6 +2855,15 @@ async function renderSettings() {
           <label class="switch"><input type="checkbox" id="usePipelineGen" ${config.ai.usePipeline ? "checked" : ""}> 默认用「初稿 → 浓缩」流水线生成新章节</label>
         </div>
 
+        ${activeMode === "github" ? "" : `<div class="row" style="margin-top:10px">
+          <label class="switch"><input type="checkbox" id="autoUnload" ${(state.aiConfig?.autoUnload ?? config.ai.autoUnload ?? true) ? "checked" : ""}> 本地模型<b>用后自动释放显存</b>（省显存/省电；下次调用需冷启动约 40 秒）</label>
+          <span class="spacer"></span>
+          <button class="btn" id="unloadNow">立即释放显存</button>
+        </div>
+        <div class="hint" style="margin-top:8px">
+          释放显存＝向推理机 <code>POST /admin/unload</code>（llama.cpp 支持）。流水线两阶段之间不会释放，避免反复冷启动；本地模型空闲约 10 分钟也会自动下线。
+        </div>`}
+
         <div class="hint" style="margin-top:12px">
           流水线两阶段都走同一个 <code>11440</code> 端口：<b>初稿</b>填 <code>webnovel</code>（灌水机，写水版正文）→ <b>浓缩</b>填 <code>gemma</code>（浓缩成精简版）。服务端按请求里的 model 字段切换后端模型。<br>
           切换模型会触发重新加载，一次流水线（水版 + 精简）比单次调用慢，请耐心等。
@@ -2568,6 +3004,34 @@ async function renderSettings() {
     toast(e.target.checked ? "已开启流水线生成" : "已关闭流水线生成");
   });
 
+  // 用后自动释放显存（存服务端）+ 立即释放按钮
+  const autoUnloadEl = $("#autoUnload");
+  if (autoUnloadEl) autoUnloadEl.addEventListener("change", async (e) => {
+    try {
+      await source().saveAiConfig({ autoUnload: e.target.checked });
+      config.ai.autoUnload = e.target.checked;
+      saveConfig();
+      if (state.aiConfig) state.aiConfig.autoUnload = e.target.checked;
+      toast(e.target.checked ? "已开启：本地模型用后自动释放显存" : "已关闭：用后不释放显存");
+    } catch (err) {
+      e.target.checked = !e.target.checked;
+      toast(`保存失败：${err.message}`, true);
+    }
+  });
+  const unloadNowEl = $("#unloadNow");
+  if (unloadNowEl) unloadNowEl.addEventListener("click", async () => {
+    unloadNowEl.disabled = true;
+    try {
+      const r = await api("/api/ai/unload", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      toast("已通知推理机释放显存");
+      $("#aiStatus").textContent = `显存已释放 · ${r.endpoint || ""}`;
+    } catch (err) {
+      toast(`释放失败：${err.message}`, true);
+    } finally {
+      unloadNowEl.disabled = false;
+    }
+  });
+
   $("#copyToOther").addEventListener("click", () => {
     const src = m.querySelector('.role-card[data-role="draft"] [data-f="baseUrl"]').value.trim();
     const key = m.querySelector('.role-card[data-role="draft"] [data-f="apiKey"]').value.trim();
@@ -2673,6 +3137,17 @@ $("#aiToggle").addEventListener("click", () => {
   else { renderAiPanel(); panel.classList.add("open"); }
 });
 $("#aiClose").addEventListener("click", closeAiPanel);
+
+/* 全局约定：点击浮层外部（空白处）一律收起 —— 覆盖 AI 改写面板、抽屉内菜单、prompt 弹窗等所有浮层 */
+document.addEventListener("click", (ev) => {
+  const panel = $("#aiPanel");
+  if (panel && panel.classList.contains("open")
+    && !panel.contains(ev.target)
+    && !ev.target.closest("#aiToggle")
+    && !ev.target.closest("[data-act='ai']")) {
+    closeAiPanel();
+  }
+});
 $("#brand").addEventListener("click", () => switchView("dash"));
 
 boot();
