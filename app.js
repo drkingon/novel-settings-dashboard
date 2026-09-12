@@ -54,8 +54,10 @@ const state = {
   view: "dash",
   aiTarget: null,
   aiCandidates: [],
+  aiCandidateLabels: null,
   aiBusy: false,
   aiStatus: "",
+  usePipeline: false,
   scrollTop: 0,
   fileShas: {},
 };
@@ -96,6 +98,22 @@ function applyLinePatch(content, startLine, endLine, newText) {
   const replacement = newText === "" ? [] : String(newText).split("\n");
   lines.splice(from, to - from + 1, ...replacement);
   return lines.join("\n") + (hadTrailing ? "\n" : "");
+}
+
+/** 在内容里按"原文"定位块的新行号（并发编辑后重新定位用） */
+function locateByAnchor(content, anchorText) {
+  if (!anchorText) return null;
+  const lines = content.split("\n");
+  const needle = String(anchorText).split("\n");
+  if (!needle.length || !needle[0]) return null;
+  outer:
+  for (let i = 0; i + needle.length <= lines.length; i += 1) {
+    for (let j = 0; j < needle.length; j += 1) {
+      if (lines[i + j] !== needle[j]) continue outer;
+    }
+    return { start: i, end: i + needle.length - 1 };
+  }
+  return null;
 }
 
 let toastTimer = null;
@@ -161,6 +179,22 @@ const LocalSource = {
     return { baseUrl: c.baseUrl, model: c.model, hasKey: c.hasKey, keyMask: c.keyMask };
   },
   async aiRewrite(payload) { return api("/api/ai/rewrite", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); },
+  async aiPipeline(payload) { return api("/api/ai/pipeline", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); },
+  async writeFile(path, content) {
+    await api("/api/file", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, content }),
+    });
+    return { path };
+  },
+  async listModels(opts) {
+    return api("/api/ai/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(opts || {}),
+    });
+  },
   async canDirectAi() { return true; },
 };
 
@@ -189,7 +223,11 @@ const GitHubSource = {
   async req(url, options = {}) {
     const res = await fetch(url, { ...options, headers: { ...this.headers(), ...(options.headers || {}) } });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.message ? `GitHub: ${data.message}` : `GitHub ${res.status}`);
+    if (!res.ok) {
+      const err = new Error(data.message ? `GitHub: ${data.message}` : `GitHub ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
     return data;
   },
   async tree(recursive = true) {
@@ -215,11 +253,37 @@ const GitHubSource = {
     const { content } = await this.read(path);
     return { path, content, size: new Blob([content]).size };
   },
-  async patch(path, start, end, newText) {
-    const { content, sha } = await this.read(path);
-    const next = applyLinePatch(content, start, end, newText);
-    await this.write(path, next, `编辑 ${path.split("/").pop()} · ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, sha);
-    return { content: next };
+  /**
+   * 保存：读-改-写，带乐观锁。
+   * 若期间被别处改过（409），自动重读、用 anchor（原文）重新定位、再试一次。
+   * 这是借鉴股票工作台「409 重试路径」的做法：不让并发编辑静默丢改动。
+   */
+  async patch(path, start, end, newText, anchor) {
+    let attempt = 0;
+    for (;;) {
+      const { content, sha } = await this.read(path);
+      let s = start;
+      let e = end;
+      if (attempt > 0 && anchor) {
+        const loc = locateByAnchor(content, anchor);
+        if (loc) { s = loc.start; e = loc.end; }
+      }
+      const next = applyLinePatch(content, s, e, newText);
+      try {
+        await this.write(path, next, `编辑 ${path.split("/").pop()} · ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, sha);
+        return { content: next, retried: attempt > 0 };
+      } catch (err) {
+        if (err.status === 409 && attempt < 2) {
+          attempt += 1;
+          await new Promise((r) => setTimeout(r, 400));
+          continue;
+        }
+        if (err.status === 409) {
+          throw new Error("这个文件刚被别处改过（可能是另一台设备），已自动重试仍未成功。请「重新载入」后再改。");
+        }
+        throw err;
+      }
+    }
   },
   /** 组装与本地模式同构的项目元数据 */
   async project() {
@@ -323,12 +387,19 @@ const GitHubSource = {
   },
   async aiConfig() {
     const a = config.ai;
-    return { baseUrl: a.baseUrl, model: a.model, hasKey: Boolean(a.apiKey), keyMask: a.apiKey ? `${a.apiKey.slice(0, 4)}…${a.apiKey.slice(-4)}` : "" };
+    return {
+      baseUrl: a.baseUrl, model: a.model,
+      hasKey: Boolean(a.apiKey),
+      keyMask: a.apiKey ? `${a.apiKey.slice(0, 4)}…${a.apiKey.slice(-4)}` : "",
+      isLocal: isLocalUrl(a.baseUrl),
+      roles: a.roles || {},
+    };
   },
   async saveAiConfig(cfg) {
     config.ai.baseUrl = cfg.baseUrl ?? config.ai.baseUrl;
     config.ai.model = cfg.model ?? config.ai.model;
     if (cfg.apiKey) config.ai.apiKey = cfg.apiKey;
+    if (cfg.roles && typeof cfg.roles === "object") config.ai.roles = cfg.roles;
     saveConfig();
     return this.aiConfig();
   },
@@ -344,6 +415,9 @@ const GitHubSource = {
       body: JSON.stringify({
         model,
         temperature: temp,
+        max_tokens: 4096,
+        // 本地推理机（llama.cpp 等）需关闭思考模式，否则正文为空；云端网关不认该参数，不发送
+        ...(isLocalUrl(baseUrl) ? { chat_template_kwargs: { enable_thinking: false } } : {}),
         messages: [
           { role: "system", content: "你是严谨的中文网文设定编辑，严格遵守文风禁令，只输出被要求的 Markdown 片段。" },
           { role: "user", content: prompt },
@@ -360,14 +434,81 @@ const GitHubSource = {
     if (candidates.every((c) => !c)) throw new Error(errors[0] || "模型没有返回内容");
     return { candidates, errors };
   },
+  /** 云端模式：浏览器直连两阶段流水线（要求两个角色都配好 Key 且网关放行跨域） */
+  async aiPipeline(payload) {
+    const roles = config.ai.roles || {};
+    const d = roles.draft, c = roles.condense;
+    if (!d?.baseUrl || !d?.model || !d?.apiKey) throw new Error("初稿模型未配置（云端直连需 Key）");
+    if (!c?.baseUrl || !c?.model || !c?.apiKey) throw new Error("浓缩模型未配置（云端直连需 Key）");
+    const draftPrompt = buildDraftPrompt({ instruction: payload.instruction, text: payload.text, context: payload.context });
+    const draft = await ghRoleCall(d, draftPrompt, 0.9);
+    let finalText = "", condenseError = "";
+    try {
+      const condPrompt = buildCondensePrompt({ instruction: "", draft, context: payload.context });
+      finalText = await ghRoleCall(c, condPrompt, 0.35);
+    } catch (e) { condenseError = e.message; }
+    if (!finalText) return { draft, final: draft, degraded: true, condenseError };
+    return { draft, final: finalText, degraded: false };
+  },
   async canDirectAi() {
     return Boolean(config.ai.baseUrl && config.ai.model && config.ai.apiKey);
+  },
+  /** 云端模式：浏览器直连拉取模型列表（要求网关放行跨域） */
+  async listModels(opts) {
+    const baseUrl = String(opts?.baseUrl || config.ai.baseUrl || "").trim();
+    const apiKey = String(opts?.apiKey || config.ai.apiKey || "").trim();
+    if (!baseUrl) throw new Error("缺少 Base URL");
+    const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    });
+    if (!res.ok) throw new Error(`${res.status} 拉取模型列表失败（云端直连需网关放行跨域）`);
+    const d = await res.json().catch(() => ({}));
+    const raw = d?.data || d?.models || [];
+    const rich = raw.map((m) => {
+      if (typeof m === "string") return { id: m, name: "", ctx: null, price: null };
+      const id = m.id || m.name || "";
+      if (!id) return null;
+      const name = (typeof m.name === "string" && m.name && m.name !== id) ? m.name : "";
+      const ctx = Number(m.context_length || m.top_provider?.context_length) || null;
+      const p = Number(m.pricing?.prompt);
+      const price = Number.isFinite(p) && p > 0 ? p * 1e6 : null;
+      return { id, name, ctx, price };
+    }).filter(Boolean);
+    rich.sort((a, b) => a.id.localeCompare(b.id));
+    return {
+      models: rich.map((m) => m.id),
+      rich,
+      local: isLocalUrl(baseUrl),
+    };
   },
 };
 
 /* ------------------------------------------------------------------ */
 /* 数据源路由                                                          */
 /* ------------------------------------------------------------------ */
+
+/** 云端模式：浏览器直连调用某个角色的模型 */
+async function ghRoleCall(role, prompt, temperature) {
+  const res = await fetch(`${role.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${role.apiKey}` },
+    body: JSON.stringify({
+      model: role.model, temperature,
+      max_tokens: 4096,
+      // 本地推理机（llama.cpp 等）需关闭思考模式，否则正文为空；云端网关不认该参数，不发送
+      ...(isLocalUrl(role.baseUrl) ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+      messages: [
+        { role: "system", content: "你是严谨的中文网文编辑，严格遵守文风禁令，只输出被要求的 Markdown 片段。" },
+        { role: "user", content: prompt },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`模型接口 ${res.status}`);
+  const d = await res.json();
+  const content = String(d?.choices?.[0]?.message?.content || "").trim();
+  if (!content) throw new Error("模型没有返回内容");
+  return content;
+}
 
 function source() {
   return activeMode === "github" ? GitHubSource : LocalSource;
@@ -422,6 +563,43 @@ function buildPrompt({ instruction, text, context }) {
   L.push("- 只输出改写后的 Markdown 片段本身，不要任何解释、前言、代码围栏");
   L.push("- 保持原有的 Markdown 结构（标题层级、表格列数、列表符号）；若是表格，必须保持列数与表头");
   L.push("- 与上文既有设定严格一致，不要引入新设定、新名字、新数值");
+  L.push("- 遵守以下文风禁令（违反即不合格）：", STYLE_RULES);
+  return L.join("\n");
+}
+
+/** 初稿阶段 prompt（浏览器端，供云端直连流水线使用） */
+function buildDraftPrompt({ instruction, text, context, note }) {
+  const c = context || {};
+  const L = [];
+  L.push("你是长篇网文的写手。请基于下面的要点 / 大纲 / 设定，写出一段完整、有画面感的初稿。");
+  L.push("", "## 项目", c.book ? `《${c.book}》` : "（未提供书名）");
+  if (c.positioning) L.push("核心定位（节选）：", c.positioning.slice(0, 900));
+  if (c.filePath) { L.push("", "## 位置", `文件：${c.filePath}`); if (c.headingPath) L.push(`章节：${c.headingPath}`); }
+  if (c.before) L.push("", "## 上文（仅供理解语境，不要改写）", c.before.slice(-1500));
+  L.push("", "## 写作要点 / 待展开内容", text);
+  if (note) L.push("", "## 额外要求", note);
+  L.push("", "## 初稿要求", instruction || "充分展开情节，写出具体动作、对话、环境细节与人物心理；保持与上文设定一致；先求完整、有料，不必过度精简。");
+  L.push("", "## 硬约束");
+  L.push("- 只输出正文本身，不要任何解释、前言、代码围栏、标题");
+  L.push("- 与既有设定严格一致，不要引入新设定、新名字、新数值");
+  L.push("- 遵守以下文风禁令（违反即不合格）：", STYLE_RULES);
+  return L.join("\n");
+}
+
+/** 浓缩阶段 prompt（浏览器端，供云端直连流水线使用） */
+function buildCondensePrompt({ instruction, draft, context, note }) {
+  const c = context || {};
+  const L = [];
+  L.push("你是资深网文编辑。下面是一段初稿，请把它浓缩、润色成最终稿。");
+  L.push("", "## 项目", c.book ? `《${c.book}》` : "（未提供书名）");
+  if (c.positioning) L.push("核心定位（节选）：", c.positioning.slice(0, 600));
+  if (c.after) L.push("", "## 下文（仅供理解语境）", c.after.slice(0, 600));
+  L.push("", "## 初稿", "```markdown", draft, "```");
+  if (note) L.push("", "## 浓缩重点", note);
+  L.push("", "## 浓缩要求", instruction || "保留全部关键情节、设定、人物动机与细节描写，输出成连贯的叙事正文；只去掉重复、口头禅和纯粹水词；保持原有的画面感、对话与人物语气，让节奏更紧凑、语言更克制有力。不要改成提纲、摘要或碎片句式。");
+  L.push("", "## 硬约束");
+  L.push("- 只输出最终稿本身，不要任何解释、前言、代码围栏、标题");
+  L.push("- 不得更改既定设定、人物名字、关键数值");
   L.push("- 遵守以下文风禁令（违反即不合格）：", STYLE_RULES);
   return L.join("\n");
 }
@@ -804,14 +982,15 @@ function bindDocEvents() {
 /* 编辑                                                                */
 /* ------------------------------------------------------------------ */
 
-async function patchLines(startLine, endLine, newText) {
-  const data = await source().patch(state.currentPath, startLine, endLine, newText);
+async function patchLines(startLine, endLine, newText, anchor) {
+  const data = await source().patch(state.currentPath, startLine, endLine, newText, anchor);
   state.content = data.content;
   state.blocks = parseBlocks(data.content);
   state.scrollTop = $("#main").scrollTop;
   renderDoc();
   $("#crumb").innerHTML = `<b>${escapeHtml(state.currentPath)}</b> · ${state.blocks.length} 块`;
   refreshProjectQuiet();
+  if (data.retried) toast("文件刚被别处改过，已自动重新定位并保存");
 }
 
 async function refreshProjectQuiet() {
@@ -845,7 +1024,7 @@ function startEditBlock(idx) {
     if (val === raw) { renderDoc(); return; }
     try {
       toast(activeMode === "github" ? "提交中…" : "保存中…");
-      await patchLines(b.start, b.bodyEnd, val);
+      await patchLines(b.start, b.bodyEnd, val, raw);
       toast(activeMode === "github" ? "已提交到 GitHub" : "已保存");
     } catch (err) {
       toast(`保存失败：${err.message}`, true);
@@ -1002,7 +1181,9 @@ function openAiPanel(idx) {
     headingPath: headingPathOf(idx),
   };
   state.aiCandidates = [];
+  state.aiCandidateLabels = null;
   state.aiStatus = "";
+  state.usePipeline = pipelineReady();
   $("#aiLoc").textContent = `${state.currentPath} : ${b.start + 1}`;
   renderAiPanel();
   $("#aiPanel").classList.add("open");
@@ -1019,21 +1200,24 @@ function renderAiPanel() {
   }
 
   const presets = AI_PRESETS.map((p, i) => `<button class="chip" data-preset="${i}">${escapeHtml(p.label)}</button>`).join("");
+  const labels = state.aiCandidateLabels || state.aiCandidates.map((_, i) => `候选 ${i + 1}`);
   const cands = state.aiCandidates.map((c, i) => `
     <div class="cand">
       <div class="ch">
-        <span class="n">候选 ${i + 1}</span><span class="sp"></span>
+        <span class="n">${escapeHtml(labels[i] || `候选 ${i + 1}`)}</span><span class="sp"></span>
         <button data-copy="${i}">复制</button>
         <button class="pri" data-apply="${i}">替换原文</button>
       </div>
       <div class="cb">${escapeHtml(c)}</div>
     </div>`).join("");
 
-  const aiKey = activeMode === "github" ? (config.ai.apiKey ? "已配置" : "") : "";
-  const hintLocal = `已配置：<b>${escapeHtml(state.aiConfig?.model || config.ai.model || "")}</b>，可直接在界面内生成。`;
+  const ready = aiReady() || pipelineReady();
+  const pipe = pipelineReady();
+  const hintLocal = `已配置：<b>${escapeHtml(state.aiConfig?.model || config.ai.model || "")}</b>${isLocalUrl(state.aiConfig?.baseUrl || config.ai.baseUrl) ? "（本地端点）" : ""}，可直接在界面内生成。`;
+  const hintPipe = `已配置双模型（初稿 + 浓缩），勾选下方「流水线」可一段过两道：先由初稿模型展开，再由浓缩模型收口。`;
   const hintNone = activeMode === "github"
-    ? `云端模式：浏览器直连模型需要网关放行跨域（OpenRouter 等）；否则用「复制 Prompt」把提示词贴到对话里让 Agent 改写。`
-    : `未配置 API。可先「复制 Prompt」贴到对话里让 Agent 改写，再贴回来；或在「设置」里填 OpenAI 兼容接口。`;
+    ? `云端模式：浏览器直连需要网关放行跨域（OpenRouter、或给 Ollama 设 OLLAMA_ORIGINS=*）；否则用「复制 Prompt」把提示词贴到对话里让 Agent 改写。`
+    : `尚未配置可用模型。到「设置 → AI 接口」选一个预设（本地 Ollama 或云端均可）；也可以一直用「复制 Prompt」。`;
 
   body.innerHTML = `
     <div class="ai-target">${escapeHtml(t.text.slice(0, 900))}${t.text.length > 900 ? "\n…" : ""}</div>
@@ -1041,13 +1225,14 @@ function renderAiPanel() {
     <div class="chips" id="presetChips">${presets}</div>
     <div class="ai-label">补充要求（可选）</div>
     <textarea class="ai-input" id="aiInstruction" placeholder="例如：把这段改得更像便利店的真实夜班口吻，别用书面语"></textarea>
-    <div class="note">${(state.aiConfig?.hasKey || aiKey) ? hintLocal : hintNone}</div>
+    <div class="note">${ready ? (pipe ? hintPipe : hintLocal) : hintNone}</div>
     <div class="row">
       <button class="btn wide" id="copyPrompt">复制 Prompt</button>
-      <button class="btn primary wide" id="runAi" ${(state.aiConfig?.hasKey || aiKey) ? "" : "disabled"}>一键生成</button>
+      <button class="btn primary wide" id="runAi" ${ready ? "" : "disabled"}>一键生成</button>
     </div>
     <div class="row">
       <label class="switch"><input type="checkbox" id="multiCand"> 出 3 个候选</label>
+      ${pipe ? `<label class="switch"><input type="checkbox" id="usePipeline" ${state.usePipeline ? "checked" : ""}> 初稿→浓缩 流水线</label>` : ""}
       <span class="spacer"></span>
       <span style="font-size:11px;color:var(--text-faint)">${state.aiBusy ? '<span class="spinner"></span> 生成中…' : escapeHtml(state.aiStatus)}</span>
     </div>
@@ -1075,7 +1260,7 @@ function renderAiPanel() {
   }));
   body.querySelectorAll("[data-apply]").forEach((el) => el.addEventListener("click", async () => {
     try {
-      await patchLines(t.start, t.bodyEnd, state.aiCandidates[Number(el.dataset.apply)]);
+      await patchLines(t.start, t.bodyEnd, state.aiCandidates[Number(el.dataset.apply)], t.text);
       toast(activeMode === "github" ? "已替换并提交" : "已替换");
       closeAiPanel();
     } catch (err) {
@@ -1122,22 +1307,41 @@ async function copyPrompt(activePreset) {
 async function runAi(activePreset) {
   const t = state.aiTarget;
   if (!t) return;
+  const usePipe = Boolean($("#usePipeline")?.checked) && pipelineReady();
+  if (usePipe) state.usePipeline = true;
   const count = $("#multiCand")?.checked ? 3 : 1;
   state.aiBusy = true;
-  state.aiStatus = "生成中…";
+  state.aiStatus = usePipe ? "流水线生成中（WebNovel 水版 → Gemma 精简）…" : "生成中…";
   renderAiPanel();
   try {
-    const { candidates } = await source().aiRewrite({
-      text: t.text,
-      instruction: collectInstruction(activePreset),
-      context: aiContextPayload(),
-      count,
-    });
-    state.aiCandidates = candidates.filter(Boolean);
-    state.aiStatus = "";
-    state.aiBusy = false;
-    renderAiPanel();
-    toast(`生成 ${state.aiCandidates.length} 个候选`);
+    if (usePipe) {
+      const r = await runPipeline({
+        text: t.text,
+        instruction: collectInstruction(activePreset),
+        context: aiContextPayload(),
+      });
+      state.aiCandidates = [r.final, r.draft].filter(Boolean);
+      state.aiCandidateLabels = r.degraded
+        ? ["水版（精简失败，已退回）", "水版"]
+        : ["精简版（Gemma 浓缩）", "水版（WebNovel 初稿，参考）"];
+      state.aiStatus = r.degraded ? `浓缩失败${r.condenseError ? "：" + r.condenseError : ""}，已退回初稿` : "";
+      state.aiBusy = false;
+      renderAiPanel();
+      toast(r.degraded ? "浓缩模型未返回，已退回初稿" : "流水线生成完成（浓缩稿 + 初稿）");
+    } else {
+      const { candidates } = await source().aiRewrite({
+        text: t.text,
+        instruction: collectInstruction(activePreset),
+        context: aiContextPayload(),
+        count,
+      });
+      state.aiCandidates = candidates.filter(Boolean);
+      state.aiCandidateLabels = null;
+      state.aiStatus = "";
+      state.aiBusy = false;
+      renderAiPanel();
+      toast(`生成 ${state.aiCandidates.length} 个候选`);
+    }
   } catch (err) {
     state.aiBusy = false;
     state.aiStatus = "";
@@ -1147,15 +1351,1026 @@ async function runAi(activePreset) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 写作视图（整合 oh-story 的写作流程）                                  */
+/* ------------------------------------------------------------------ */
+
+const SKILL_DIR = "/Users/iikuma/WorkBuddy/写作/skills";
+const WORD_RANGE = "2200–2500";
+
+/** 从章级大纲解析章节表 */
+function parseChaptersFromOutline(md) {
+  const lines = String(md).split("\n");
+  const chapters = [];
+  let night = null;
+  let nightTitle = "";
+  for (const line of lines) {
+    const n = line.match(/^##\s*第\s*(\d+)\s*夜\s*[·・]?\s*(.*?)(?:（|\(|$)/);
+    if (n) { night = Number(n[1]); nightTitle = n[2].trim(); continue; }
+    const c = line.match(/^\|\s*(\d{1,3})\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|/);
+    if (!c) continue;
+    const no = Number(c[1]);
+    if (no < 1 || no > 300) continue;
+    const func = c[2].trim();
+    if (!func || func.includes("---")) continue;
+    const hook = c[4].trim();
+    const ht = hook.match(/^(信息差|情绪|预告|对话|悬念)/);
+    chapters.push({
+      no,
+      night,
+      nightTitle,
+      func,
+      beat: c[3].trim(),
+      hook,
+      hookType: ht ? ht[1] : "",
+    });
+  }
+  return chapters;
+}
+
+function flattenTree(nodes, out = []) {
+  for (const n of nodes || []) {
+    if (n.type === "file") out.push(n.path);
+    else if (n.children) flattenTree(n.children, out);
+  }
+  return out;
+}
+
+function chapterFileName(no, title) {
+  const nnn = String(no).padStart(3, "0");
+  const clean = String(title || "").replace(/[\\/:*?"<>|\s]/g, "").slice(0, 12) || "章";
+  return `正文/第${nnn}章_${clean}.md`;
+}
+
+async function loadChapters(force = false) {
+  if (state.chapters && !force) return state.chapters;
+  const outline = await source().file("大纲/章级大纲.md");
+  const list = parseChaptersFromOutline(outline.content);
+  const files = flattenTree(state.project?.tree || []);
+  for (const ch of list) {
+    const nnn = String(ch.no).padStart(3, "0");
+    ch.outlinePath = files.find((p) => new RegExp(`^大纲/细纲_第${nnn}章`).test(p)) || null;
+    ch.draftPath = files.find((p) => new RegExp(`^正文/第${nnn}章`).test(p)) || null;
+    ch.hasOutline = Boolean(ch.outlinePath);
+    ch.hasDraft = Boolean(ch.draftPath);
+  }
+  state.chapters = list;
+  return list;
+}
+
+async function renderWriting() {
+  const m = $("#main");
+  m.innerHTML = `<div class="empty">读取大纲…</div>`;
+  try {
+    const chapters = await loadChapters(true);
+    if (!chapters.length) {
+      m.innerHTML = `<div class="empty">
+        没能从「大纲/章级大纲.md」解析出章节。<br><br>
+        请确认该文件里有 <code>| 章号 | 功能 | 关键节拍 | 章末钩子 |</code> 格式的表格。
+      </div>`;
+      return;
+    }
+    renderWritingUI();
+  } catch (err) {
+    m.innerHTML = `<div class="empty">读取失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderWritingUI() {
+  const m = $("#main");
+  const chapters = state.chapters;
+  const done = chapters.filter((c) => c.hasDraft).length;
+  const outlined = chapters.filter((c) => c.hasOutline).length;
+  const sel = state.selectedChapter;
+
+  const rows = chapters.map((c) => {
+    const on = sel === c.no ? " on" : "";
+    const flags = [
+      c.night ? `<span class="flag night">第${c.night}夜</span>` : "",
+      c.hookType ? `<span class="flag hook">${escapeHtml(c.hookType)}</span>` : "",
+      c.hasOutline ? `<span class="flag ok">细纲</span>` : `<span class="flag todo">无细纲</span>`,
+      c.hasDraft ? `<span class="flag ok">正文</span>` : `<span class="flag todo">未写</span>`,
+    ].join("");
+    return `<div class="ch${on}" data-ch="${c.no}">
+      <div class="no">${String(c.no).padStart(2, "0")}</div>
+      <div class="body">
+        <div class="title">${escapeHtml(c.func || "（未命名）")}</div>
+        <div class="beat">${escapeHtml(c.beat || "")}</div>
+      </div>
+      <div class="flags">${flags}</div>
+      <button class="ch-create" data-create="${c.no}" title="打开创作台">创作 ›</button>
+    </div>`;
+  }).join("");
+
+  const detail = sel ? renderChapterDetail(chapters.find((c) => c.no === sel)) : "";
+
+  m.innerHTML = `
+    <div class="writing">
+      <div class="w-head">
+        <h1>写作</h1>
+        <span class="sub">${escapeHtml(state.project?.book || "")}</span>
+      </div>
+      <p class="w-lede">每章一个单元：出细纲 → 写正文 → 去 AI 味 → 审查。点章节展开操作，Prompt 会把大纲节拍、设定、伏笔、角色知识状态、文风禁令一并打包。</p>
+
+      <div class="w-stats">
+        <span class="w-stat"><b>${chapters.length}</b>章规划</span>
+        <span class="w-stat"><b>${outlined}</b>章有细纲</span>
+        <span class="w-stat"><b>${done}</b>章已写正文</span>
+      </div>
+
+      <div class="w-note">
+        <b>创作流程</b>：点任一章的 <b>「创作 ›」</b>（或展开后点「创作」）→ 右侧滑出<b>创作台</b>，里面按 oh-story 四步走：①出细纲 → ②写正文 → ③去 AI 味 → ④审查。<br>
+        创作台内可<b>粘贴我给你的 prompt</b>，也可点「打包」自动生成；执行方式两种：<b>生成本章</b>（本地模型直出）与<b>流水线</b>（webnovel 水版 → gemma 精简）。结果落在下方编辑区，<b>可直接手改</b>，⌘/Ctrl+S 保存。
+      </div>
+
+      <div class="ch-list">${rows}</div>
+      ${detail}
+    </div>
+  `;
+
+  m.querySelectorAll(".ch").forEach((el) => {
+    el.addEventListener("click", async () => {
+      const no = Number(el.dataset.ch);
+      state.selectedChapter = state.selectedChapter === no ? null : no;
+      renderWritingUI();
+      if (state.selectedChapter) {
+        const d = m.querySelector(".ch-detail");
+        if (d) d.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+    });
+  });
+  // 行内「创作」按钮：直接开右侧创作台，不展开详情
+  m.querySelectorAll("[data-create]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const ch = state.chapters.find((c) => c.no === Number(btn.dataset.create));
+      if (ch) openWritingDrawer(ch, "draft");
+    });
+  });
+  bindChapterDetail();
+}
+
+function renderChapterDetail(ch) {
+  if (!ch) return "";
+  const nnn = String(ch.no).padStart(3, "0");
+  const draftName = ch.draftPath ? ch.draftPath.split("/").pop() : chapterFileName(ch.no, ch.func).split("/").pop();
+  return `
+    <div class="ch-detail">
+      <div class="dh">
+        <span class="t">第 ${ch.no} 章 · ${escapeHtml(ch.func || "")}</span>
+        <span class="sp"></span>
+        <span class="flag night">${ch.night ? `第 ${ch.night} 夜 · ${escapeHtml(ch.nightTitle || "")}` : "—"}</span>
+      </div>
+      <div class="db">
+        <div class="rowline"><span class="k">关键节拍</span><span class="v">${escapeHtml(ch.beat || "—")}</span></div>
+        <div class="rowline"><span class="k">章末钩子</span><span class="v">${escapeHtml(ch.hook || "—")}</span></div>
+        <div class="rowline"><span class="k">细纲</span><span class="v">${ch.hasOutline ? `<b>${escapeHtml(ch.outlinePath)}</b>` : "还没出（先跑「出本章细纲」）"}</span></div>
+        <div class="rowline"><span class="k">正文</span><span class="v">${ch.hasDraft ? `<b>${escapeHtml(ch.draftPath)}</b>` : `还没写（将写入 ${escapeHtml(draftName)}）`}</span></div>
+      </div>
+      <div class="ops">
+        <button class="op primary" data-op="create"><span>创作 ›</span><span class="k">打开右侧创作台</span></button>
+        <button class="op" data-op="copy-outline"><span>出本章细纲</span><span class="k">复制 Prompt</span></button>
+        <button class="op" data-op="copy-draft"><span>写本章正文</span><span class="k">复制 Prompt</span></button>
+        <button class="op" data-op="copy-deslop"><span>去 AI 味</span><span class="k">复制 Prompt</span></button>
+        <button class="op" data-op="copy-review"><span>审查本章</span><span class="k">复制 Prompt</span></button>
+        <span style="flex:1"></span>
+        <button class="op" data-op="gen-outline" data-gen="outline"><span>一键出细纲</span></button>
+        <button class="op" data-op="open-draft"><span>打开正文</span></button>
+      </div>
+      <div id="draftBox"></div>
+    </div>
+  `;
+}
+
+/* ---------------------------------------------------------------- */
+/* 创作抽屉（右侧）                                                    */
+/* ---------------------------------------------------------------- */
+
+const WRITING_STEPS = [
+  { key: "outline", n: "①", name: "出细纲" },
+  { key: "draft", n: "②", name: "写正文" },
+  { key: "deslop", n: "③", name: "去 AI 味" },
+  { key: "review", n: "④", name: "审查" },
+];
+
+/** 各任务的默认落盘路径 */
+function drawerSavePath(ch, task) {
+  const nnn = String(ch.no).padStart(3, "0");
+  if (task === "outline") return `大纲/细纲_第${nnn}章.md`;
+  if (task === "review") return `追踪/审查_第${nnn}章.md`;
+  return ch.draftPath || chapterFileName(ch.no, ch.func);
+}
+
+/** 打开某章的创作抽屉 */
+async function openWritingDrawer(ch, task = "draft") {
+  document.getElementById("wdDrawer")?.remove();
+  const drawer = document.createElement("aside");
+  drawer.id = "wdDrawer";
+  drawer.className = "wd";
+  drawer.innerHTML = `
+    <div class="wd-head">
+      <div class="wd-crumb">
+        <span class="bk">${escapeHtml(state.project?.book || "（未载入）")}</span>
+        <span class="sep">›</span>
+        <span class="bk">${ch.night ? `第 ${ch.night} 夜 · ${escapeHtml(ch.nightTitle || "")}` : "未分夜"}</span>
+        <span class="sep">›</span>
+        <span class="bk cur">第 ${ch.no} 章</span>
+      </div>
+      <div class="wd-title">
+        <span class="no">${String(ch.no).padStart(2, "0")}</span>
+        <h2>${escapeHtml(ch.func || "（未命名章节）")}</h2>
+        <span class="wd-badges">
+          <span class="flag ${ch.hasOutline ? "ok" : "todo"}" id="wdBadgeOutline">${ch.hasOutline ? "有细纲" : "无细纲"}</span>
+          <span class="flag ${ch.hasDraft ? "ok" : "todo"}" id="wdBadgeDraft">${ch.hasDraft ? "有正文" : "未写正文"}</span>
+        </span>
+        <span class="sp"></span>
+        <button class="wd-x" id="wdClose" title="关闭（Esc）">✕</button>
+      </div>
+      <div class="wd-meta">
+        <div class="mi"><span class="k">关键节拍</span><span class="v">${escapeHtml(ch.beat || "—")}</span></div>
+        <div class="mi"><span class="k">章末钩子</span><span class="v">${escapeHtml((ch.hookType ? `[${ch.hookType}] ` : "") + (ch.hook || "—"))}</span></div>
+      </div>
+    </div>
+
+    <nav class="wd-steps" id="wdSteps">
+      ${WRITING_STEPS.map((s) => `<button class="wstep${s.key === task ? " on" : ""}" data-task="${s.key}"><b>${s.n}</b>${s.name}</button>`).join("")}
+    </nav>
+
+    <section class="wd-sec">
+      <div class="wd-sh">
+        <span class="lbl">Prompt</span>
+        <span class="hint">可粘贴我给你的 prompt；或点「打包」按本章上下文自动生成</span>
+        <span class="sp"></span>
+        <button class="mini" id="wdPack">打包</button>
+        <button class="mini" id="wdCopy">复制</button>
+      </div>
+      <textarea id="wdPrompt" class="wd-prompt" spellcheck="false" placeholder="把 prompt 粘贴到这里，或点「打包」生成…"></textarea>
+    </section>
+
+    <section class="wd-sec">
+      <div class="wd-sh">
+        <span class="lbl">AI 执行</span>
+        <span class="hint" id="wdRunHint">本地模型（11440）</span>
+        <span class="sp"></span>
+        <button class="btn primary" id="wdRun" ${aiReady() ? "" : "disabled"}>生成本章</button>
+        <button class="btn" id="wdPipe" ${aiReady() && task === "draft" ? "" : "disabled"}>流水线（水版→精简）</button>
+      </div>
+    </section>
+
+    <section class="wd-sec grow">
+      <div class="wd-sh">
+        <span class="lbl" id="wdEdLabel">${task === "outline" ? "细纲" : task === "review" ? "审查报告" : task === "deslop" ? "改稿" : "正文"}</span>
+        <span class="hint">直接编辑；⌘/Ctrl+S 保存</span>
+        <span class="sp"></span>
+        <span class="wc" id="wdCount">0 字</span>
+        <button class="mini" id="wdRestore" hidden>恢复上次内容</button>
+        <button class="mini" id="wdLoad">载入已存正文</button>
+        <button class="mini" id="wdClear">清空</button>
+      </div>
+      <textarea id="wdEditor" class="wd-editor" spellcheck="false" placeholder="生成结果会出现在这里，也可以直接手写…"></textarea>
+    </section>
+
+    <footer class="wd-foot">
+      <input id="wdPath" class="wd-path" value="${escapeHtml(drawerSavePath(ch, task))}" />
+      <button class="btn primary" id="wdSave">保存</button>
+      <span class="wd-status" id="wdStatus"></span>
+    </footer>
+  `;
+  document.body.appendChild(drawer);
+
+  const q = (s) => drawer.querySelector(s);
+  const promptEl = q("#wdPrompt");
+  const editorEl = q("#wdEditor");
+  const statusEl = q("#wdStatus");
+  const countEl = q("#wdCount");
+  let curTask = task;
+  let genSnapshot = null;          // 生成前编辑器快照，用于「恢复上次内容」
+  const taskContent = {};          // 各步骤编辑器内容缓存（切换步骤不丢）
+  let lastSaved = "";              // 上次落盘/载入的内容，用于未保存判断
+
+  const setStatus = (t, isErr) => { statusEl.textContent = t || ""; statusEl.classList.toggle("err", Boolean(isErr)); };
+  const updCount = () => { const n = editorEl.value.replace(/\s/g, "").length; countEl.textContent = `${n} 字`; };
+
+  // 按当前任务载入对应文件内容（不再无条件把正文灌进编辑器）
+  const loadEditorForTask = async (t) => {
+    const path = drawerSavePath(ch, t);
+    let content = "";
+    try {
+      const f = await source().file(path);
+      if (f?.content) content = f.content;
+    } catch { /* 读取失败不阻塞 */ }
+    if (!content && taskContent[t]) content = taskContent[t];
+    editorEl.value = content;
+    lastSaved = content;
+    updCount();
+    return content;
+  };
+  const loaded = await loadEditorForTask(curTask);
+  if (loaded) setStatus(`已载入 ${drawerSavePath(ch, curTask)}`);
+
+  const pack = async () => {
+    try {
+      setStatus("正在打包上下文…");
+      const p = await buildChapterPrompt(ch, curTask, { local: true });
+      promptEl.value = p;
+      setStatus(`已打包（${p.length} 字）`);
+    } catch (err) {
+      setStatus(`打包失败：${err.message}`, true);
+    }
+  };
+
+  const switchTask = async (t) => {
+    if (t === curTask) return;
+    taskContent[curTask] = editorEl.value; // 缓存当前步骤内容
+    curTask = t;
+    drawer.querySelectorAll(".wstep").forEach((b) => b.classList.toggle("on", b.dataset.task === t));
+    q("#wdPipe").disabled = !(aiReady() && t === "draft");
+    q("#wdPath").value = drawerSavePath(ch, t);
+    promptEl.value = "";
+    setStatus("");
+    await loadEditorForTask(t);
+  };
+
+  const run = async (mode) => {
+    const p = promptEl.value.trim();
+    if (!p) { setStatus("先粘贴或打包一个 prompt", true); return; }
+    const btn = mode === "pipe" ? q("#wdPipe") : q("#wdRun");
+    btn.disabled = true;
+    setStatus(mode === "pipe" ? "流水线：WebNovel 写水版 → Gemma 精简…" : "本地模型生成中（冷启动约 40 秒）…");
+    try {
+      let out = "";
+      if (mode === "pipe") {
+        const r = await runPipeline({ text: p, instruction: "本阶段是水版，请充分铺开、先求完整有料。", context: {} });
+        out = r.final || r.draft || "";
+        if (r.draft) promptEl.dataset.water = r.draft;
+      } else {
+        const d = await api("/api/ai/raw", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: p, temperature: 0.85, max_tokens: 4096 }) });
+        out = String(d.content || "");
+      }
+      if (!out) throw new Error("模型返回空内容");
+      if (editorEl.value.trim()) {       // 编辑器里已有内容 → 先存快照，防止手写内容丢失
+        genSnapshot = editorEl.value;
+        q("#wdRestore").hidden = false;
+      }
+      editorEl.value = out;
+      updCount();
+      setStatus(`生成完成（${out.length} 字）；原内容可点「恢复上次内容」还原`);
+      toast("已生成，可直接编辑后保存");
+    } catch (err) {
+      setStatus(`失败：${err.message}`, true);
+      toast(`生成失败：${err.message}`, true);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
+  const esc = (e) => { if (e.key === "Escape" && document.body.contains(drawer)) close(); };
+  const close = () => {
+    if (editorEl.value.trim() && editorEl.value !== lastSaved) {
+      if (!confirm("编辑器有未保存的内容，确定关闭并丢弃？")) return;
+    }
+    document.removeEventListener("keydown", esc);
+    drawer.classList.add("out");
+    setTimeout(() => drawer.remove(), 180);
+  };
+
+  q("#wdClose").addEventListener("click", close);
+  drawer.addEventListener("click", (e) => { if (e.target === drawer) close(); });
+  document.addEventListener("keydown", esc);
+  editorEl.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); q("#wdSave").click(); }
+  });
+  editorEl.addEventListener("input", updCount);
+  drawer.querySelectorAll(".wstep").forEach((b) => b.addEventListener("click", () => switchTask(b.dataset.task)));
+  q("#wdPack").addEventListener("click", pack);
+  q("#wdCopy").addEventListener("click", async () => {
+    if (!promptEl.value) await pack();
+    await navigator.clipboard.writeText(promptEl.value);
+    setStatus("已复制 prompt");
+  });
+  q("#wdRun").addEventListener("click", () => run("single"));
+  q("#wdPipe").addEventListener("click", () => run("pipe"));
+  q("#wdLoad").addEventListener("click", async () => {
+    const path = drawerSavePath(ch, curTask);
+    try {
+      const f = await source().file(path);
+      editorEl.value = f?.content || "";
+      lastSaved = editorEl.value;
+      updCount();
+      setStatus(`已载入 ${path}`);
+    } catch (err) { setStatus(`载入失败：${err.message}`, true); }
+  });
+  q("#wdClear").addEventListener("click", () => {
+    if (editorEl.value && !confirm("清空编辑器内容？")) return;
+    editorEl.value = ""; updCount();
+  });
+  q("#wdRestore").addEventListener("click", () => {
+    if (genSnapshot == null) return;
+    editorEl.value = genSnapshot; updCount();
+    q("#wdRestore").hidden = true;
+    setStatus("已恢复生成前的内容");
+  });
+  q("#wdSave").addEventListener("click", async () => {
+    const path = q("#wdPath").value.trim();
+    if (!path) { setStatus("填保存路径", true); return; }
+    if (!editorEl.value.trim()) { setStatus("内容为空", true); return; }
+    try {
+      if (curTask === "deslop") {
+        // 去 AI 味：覆盖前先备份原文件
+        try {
+          const orig = await source().file(path);
+          if (orig?.content) {
+            const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+            await source().writeFile(`${path}.bak-${stamp}.md`, orig.content);
+          }
+        } catch { /* 原文件不存在则无需备份 */ }
+      }
+      await source().writeFile(path, editorEl.value);
+      lastSaved = editorEl.value;
+      // 保存后即时刷新抽屉内章状态徽标
+      const isOutline = /细纲/.test(path);
+      const dBadge = q("#wdBadgeDraft"), oBadge = q("#wdBadgeOutline");
+      if (isOutline) { oBadge.className = "flag ok"; oBadge.textContent = "有细纲"; }
+      else { dBadge.className = "flag ok"; dBadge.textContent = "有正文"; }
+      setStatus(`已保存 ${path}`);
+      toast(`已保存：${path}`);
+      await loadChapters(true);
+      renderWritingUI();
+    } catch (err) {
+      setStatus(`保存失败：${err.message}`, true);
+      toast(`保存失败：${err.message}`, true);
+    }
+  });
+
+  requestAnimationFrame(() => drawer.classList.add("in"));
+  await pack();
+  editorEl.focus();
+}
+
+function bindChapterDetail() {
+  const m = $("#main");
+  const ch = state.chapters.find((c) => c.no === state.selectedChapter);
+  if (!ch) return;
+
+  const handle = async (op) => {
+    if (op === "create") return openWritingDrawer(ch, "draft");
+    if (op === "open-draft") {
+      if (ch.draftPath) openFile(ch.draftPath);
+      else toast("这一章还没写正文");
+      return;
+    }
+    if (op === "copy-outline") return copyChapterPrompt(ch, "outline");
+    if (op === "copy-draft") return copyChapterPrompt(ch, "draft");
+    if (op === "copy-deslop") return copyChapterPrompt(ch, "deslop");
+    if (op === "copy-review") return copyChapterPrompt(ch, "review");
+    if (op === "gen-outline") return genChapter(ch, "outline");
+  };
+
+  m.querySelectorAll(".op").forEach((btn) => {
+    btn.addEventListener("click", () => handle(btn.dataset.op));
+  });
+}
+
+/* ── 上下文收集 ─────────────────────────────────────────────────── */
+
+async function collectWriteContext(ch) {
+  const readOpt = async (p) => {
+    try { return (await source().file(p)).content; } catch { return ""; }
+  };
+  const [positioning, world, foreshadow, knowledge, hooks, rulebook] = await Promise.all([
+    readOpt("设定/题材定位.md"),
+    readOpt("设定/世界观与技能体系.md"),
+    readOpt("主线/表3-伏笔管理.md"),
+    readOpt("主线/表2-角色知识状态.md"),
+    readOpt("主线/钩子矩阵.md"),
+    readOpt("大纲/副本一-规则体系.md"),
+  ]);
+
+  let prevTail = "";
+  if (ch.no > 1) {
+    const nnn = String(ch.no - 1).padStart(3, "0");
+    const files = flattenTree(state.project?.tree || []);
+    const prev = files.find((p) => new RegExp(`^正文/第${nnn}章`).test(p));
+    if (prev) {
+      const c = await readOpt(prev);
+      prevTail = c.replace(/\s+$/, "").slice(-900);
+    }
+  }
+
+  // 只取本章相关的伏笔行与钩子行，避免 prompt 过长
+  const pickLines = (md, keyword) => String(md).split("\n")
+    .filter((l) => l.startsWith("|") && (l.includes(keyword) || keyword === ""))
+    .slice(0, 8).join("\n");
+
+  return {
+    positioning: String(positioning).slice(0, 1600),
+    world: String(world).slice(0, 1600),
+    rulebook: String(rulebook).slice(0, 1400),
+    foreshadow: ch.no ? pickLines(foreshadow, `第 ${ch.no} `) || String(foreshadow).slice(0, 1400) : "",
+    knowledge: String(knowledge).slice(0, 1600),
+    hooks: pickLines(hooks, `| ${ch.no} |`) || "",
+    prevTail,
+  };
+}
+
+/* ── Prompt 模板 ────────────────────────────────────────────────── */
+
+const RAW_PACK_TASKS = {
+  outline: {
+    name: "出本章细纲",
+    refs: [
+      "story-long-write/references/workflow-setup.md :: Phase 3 大纲搭建 · 中途补纲/扩纲小流程",
+      "story-long-write/references/outline-methods.md",
+      "story-long-write/references/long-chapter-hooks.md",
+    ],
+    deliver: (ch, nnn) => `产出写入 \`大纲/细纲_第${nnn}章.md\`（沿用本项目已有细纲的格式；本项目大纲在 \`大纲/章级大纲.md\`）。`,
+    extra: "细纲要落到可写：场景、事件顺序、情绪落点、章末钩子、该埋/该收伏笔。默认停在细纲交付，不要顺手写正文。",
+  },
+  draft: {
+    name: "写本章正文",
+    refs: [
+      "story-long-write/references/workflow-chapter.md :: 单章写作流程 1–13 步 + Phase 5 质量检查",
+      "story-long-write/references/long-format.md",
+      "story-long-write/references/writing-craft.md",
+      "story-long-write/references/long-chapter-quality.md",
+      "story-long-write/references/long-chapter-hooks.md",
+      "story-long-write/references/long-suspense.md :: 仅悬疑/异常线索章加读",
+    ],
+    deliver: (ch, nnn) => `正文写入 \`正文/第${nnn}章_章名.md\`（章名自拟，≤12 字，不加书名号）。`,
+    extra: "写完同一轮内跑去 AI 味自检，清零 blocking 项后再交。报告：实际字数、命中的禁令与修正、本章钩子落在哪一段。",
+  },
+  deslop: {
+    name: "去 AI 味",
+    refs: [
+      "story-deslop/SKILL.md",
+      "story-long-write/references/anti-ai-writing.md",
+    ],
+    deliver: () => "原文件覆盖前先备份（`_vN` 版本化），改后写入原文位置。",
+    extra: "先跑扫描定位，再按「最毒句式速查 + 禁用词」逐条改写；给出「原句 → 问题 → 改后」判定表，不要只报数字。",
+  },
+  review: {
+    name: "审查本章",
+    refs: ["story-review/SKILL.md"],
+    deliver: () => "输出审查结论，不要直接改正文（待确认后再改）。",
+    extra: "按多视角审查：主线一致性、角色知识状态越界、伏笔埋收、钩子兑现、文风违规、信息增量。",
+  },
+};
+
+async function buildChapterPrompt(ch, task, opts = {}) {
+  const t = RAW_PACK_TASKS[task];
+  const nnn = String(ch.no).padStart(3, "0");
+  const ctx = await collectWriteContext(ch);
+  const book = state.project?.book || "";
+  const root = state.project?.root || "";
+  // 节选内容里的标题降两级，避免与 prompt 自身层级混淆
+  const demote = (s) => String(s || "").replace(/^(#{1,6})\s/gm, (m, h) => `${"#".repeat(Math.min(6, h.length + 2))} `);
+
+  const L = [];
+  L.push(`你是《${book}》的长篇网文写作执行者。任务：**${t.name}（第 ${ch.no} 章）**。`);
+  L.push("");
+  if (opts.local) {
+    // 本地模型没有文件权限，读不到 reference 路径 → 换成蒸馏好的写作要点
+    L.push("## 执行方式（本地模型，无文件权限）");
+    L.push("你读不到任何外部文档；写作方法论已蒸馏为以下要点，必须遵守：");
+    L.push("- 只输出成果本身，不要解释、前言、代码围栏、收尾客套");
+    L.push("- 正文 2200–2500 字；单场景优先写「动作 + 对话 + 环境细节」，情绪不直说，靠行为与物证落地");
+    L.push("- 每个信息点只出现一次；不重复解释设定；回忆压缩到两句以内，不写大段「他想起」");
+    L.push("- 对话必须有信息增量或张力，禁寒暄垫场；人物区分靠用词与节奏，不靠语气标签");
+    L.push("- 章末必须落在「章末钩子」上：不收束、不总结、不升华、不预告");
+    L.push("- 人名、数值、伏笔状态与下方各节严格一致；「角色知识状态」里谁不知道的事，谁的视角就绝不能说破");
+  } else {
+    L.push("## 第一步：先读 reference（强制，先读后写，不得跳过）");
+    t.refs.forEach((r) => {
+      const [p, note] = r.split(" :: ");
+      L.push(`- ${SKILL_DIR}/${p}${note ? `（${note}）` : ""}`);
+    });
+  }
+  L.push("");
+  L.push("## 项目");
+  L.push(`书名：${book}`);
+  L.push(`项目目录：${root}`);
+  if (ch.night) L.push(`章节归属：第 ${ch.night} 夜 · ${ch.nightTitle || ""}`);
+  L.push("");
+  L.push(`## 第 ${ch.no} 章 · 大纲锚点（不得偏离）`);
+  L.push(`- 功能：${ch.func || "—"}`);
+  L.push(`- 关键节拍：${ch.beat || "—"}`);
+  L.push(`- 章末钩子（${ch.hookType || "未标"}）：${ch.hook || "—"}`);
+  L.push("");
+  if (ctx.positioning) {
+    L.push("## 题材定位（节选）");
+    L.push(demote(ctx.positioning));
+    L.push("");
+  }
+  if (ctx.world) {
+    L.push("## 世界观与技能（节选）");
+    L.push(demote(ctx.world));
+    L.push("");
+  }
+  if (ctx.rulebook) {
+    L.push("## 副本规则体系（节选 · 本书的核心机制）");
+    L.push(demote(ctx.rulebook));
+    L.push("");
+  }
+  if (ctx.foreshadow) {
+    L.push("## 本章相关伏笔");
+    L.push(demote(ctx.foreshadow));
+    L.push("");
+  }
+  if (ctx.knowledge) {
+    L.push("## 角色知识状态（谁知道什么 / 谁绝不能知道什么）");
+    L.push(demote(ctx.knowledge));
+    L.push("");
+  }
+  if (ctx.hooks) {
+    L.push("## 钩子矩阵（相邻章禁同型）");
+    L.push(demote(ctx.hooks));
+    L.push("");
+  }
+  if (ctx.prevTail) {
+    L.push("## 上一章结尾（衔接用，不要重复写这段）");
+    L.push("```");
+    L.push(ctx.prevTail);
+    L.push("```");
+    L.push("");
+  }
+  L.push("## Constraint Lock（原样锁定，禁止越界）");
+  L.push(`- 字数：${WORD_RANGE} 字（按本项目章级大纲惯例）`);
+  L.push(`- 必发生：${ch.beat || "见关键节拍"}`);
+  L.push("- 禁止发生：把顾客当敌人处理（本书铁律——只靠服务通关，禁打斗、禁用工具箱道具伤害顾客）");
+  L.push(`- 本章停笔点：${ch.hook || "见章末钩子"}`);
+  L.push("");
+  L.push("## 文风禁令（违反即不合格）");
+  L.push(STYLE_RULES);
+  L.push("");
+  L.push("## 交付");
+  L.push(`1. ${t.deliver(ch, nnn)}`);
+  L.push(`2. ${t.extra}`);
+  return L.join("\n");
+}
+
+/** 哪些任务的成果可以直接落盘：细纲 / 正文 */
+function promptSaveTarget(ch, task) {
+  const nnn = String(ch.no).padStart(3, "0");
+  if (task === "outline") return `大纲/细纲_第${nnn}章.md`;
+  if (task === "draft") return `正文/第${nnn}章_未命名.md`;
+  return null;
+}
+
+/** Prompt 运行弹窗：本地精简版可直接用本地大模型执行；完整版可复制贴给 Agent */
+async function openPromptRunDialog(ch, task, fullPrompt) {
+  $("#pvOverlay")?.remove();
+  const t = RAW_PACK_TASKS[task];
+  const savePath = promptSaveTarget(ch, task);
+  let localPrompt;
+  try { localPrompt = await buildChapterPrompt(ch, task, { local: true }); }
+  catch { localPrompt = fullPrompt; }
+
+  const overlay = document.createElement("div");
+  overlay.id = "pvOverlay";
+  overlay.className = "pv-overlay";
+  overlay.innerHTML = `
+    <div class="pv-dialog">
+      <div class="pv-h">
+        <span>${escapeHtml(t.name)} · 第 ${ch.no} 章</span>
+        <span class="spacer"></span>
+        <button class="mini" id="pvClose">关闭 ✕</button>
+      </div>
+      <div class="pv-sub">
+        本地模型<b>没有文件权限</b>，读不到 reference 路径——默认给「本地精简版」（写作要点已内联，书内设定本就在提示词里）。
+        也可切「完整版」复制后贴到对话里，由 Agent 按 oh-story 流程精读 references 后执行（质量更高）。
+      </div>
+      <div class="chips" id="pvVariant">
+        <button class="chip on" data-v="local">本地精简版（可直接执行）</button>
+        <button class="chip" data-v="full">完整版（贴给 Agent）</button>
+      </div>
+      <textarea id="pvPrompt" class="pv-prompt" spellcheck="false"></textarea>
+      <div class="pv-actions">
+        <button class="btn primary" id="pvRun" ${aiReady() ? "" : "disabled"}>用本地大模型执行</button>
+        ${task === "draft" ? `<button class="btn" id="pvPipe">流水线：WebNovel 水版 → Gemma 精简</button>` : ""}
+        <button class="btn" id="pvCopy">复制当前版本</button>
+        <span class="spacer"></span>
+        <span class="pv-status" id="pvStatus"></span>
+      </div>
+      ${task === "draft" ? `<div class="pv-sub">流水线两阶段都走 <code>11440</code>：先以 <code>model=webnovel</code> 写水版正文，再以 <code>model=gemma</code> 浓缩成精简版（服务端按请求里的 model 字段切换后端）。切换模型可能触发重新加载，耗时比单次调用长。</div>` : ""}
+      <div class="pv-result" id="pvResult" hidden>
+        <div class="pv-rh">
+          <span id="pvResultTitle">结果</span>
+          <span class="pv-count" id="pvCount"></span>
+          <span class="spacer"></span>
+          <button class="mini" id="pvCopyDraft" hidden>复制水版</button>
+          <button class="mini" id="pvCopyResult">复制结果</button>
+          ${savePath ? `<button class="mini primary" id="pvSave">保存到文件</button>` : ""}
+        </div>
+        ${savePath ? `<div class="pv-path"><label>保存路径</label><input id="pvPath" value="${escapeHtml(savePath)}" /></div>` : ""}
+        <div class="pv-raw" id="pvRaw"></div>
+        <details class="pv-draft" id="pvDraftWrap" hidden>
+          <summary>查看水版初稿（WebNovel 产出，仅供参考）</summary>
+          <div class="pv-raw" id="pvDraftRaw"></div>
+        </details>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const $ = (sel) => overlay.querySelector(sel);
+  const promptEl = $("#pvPrompt");
+  const statusEl = $("#pvStatus");
+  promptEl.value = localPrompt;
+
+  const close = () => overlay.remove();
+  $("#pvClose").addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  document.addEventListener("keydown", function esc(e) {
+    if (e.key === "Escape" && document.body.contains(overlay)) { close(); document.removeEventListener("keydown", esc); }
+  });
+
+  overlay.querySelectorAll("[data-v]").forEach((el) => el.addEventListener("click", () => {
+    overlay.querySelectorAll("[data-v]").forEach((x) => x.classList.toggle("on", x === el));
+    promptEl.value = el.dataset.v === "local" ? localPrompt : fullPrompt;
+  }));
+
+  $("#pvCopy").addEventListener("click", async () => {
+    await navigator.clipboard.writeText(promptEl.value);
+    statusEl.textContent = `已复制（${promptEl.value.length} 字）`;
+  });
+
+  $("#pvRun").addEventListener("click", async () => {
+    const btn = $("#pvRun");
+    btn.disabled = true;
+    statusEl.innerHTML = '<span class="spinner"></span> 本地模型生成中…（首次冷启动约 40 秒）';
+    $("#pvResult").hidden = true;
+    try {
+      const data = await api("/api/ai/raw", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: promptEl.value, temperature: 0.85, max_tokens: 4096 }),
+      });
+      const out = String(data.content || "");
+      if (!out) throw new Error("模型返回空内容");
+      $("#pvRaw").textContent = out;
+      $("#pvResultTitle").textContent = "结果";
+      $("#pvCount").textContent = `${out.length} 字`;
+      $("#pvDraftWrap").hidden = true;
+      $("#pvCopyDraft").hidden = true;
+      $("#pvResult").hidden = false;
+      statusEl.textContent = "";
+      toast("生成完成，请检查后保存或复制");
+    } catch (err) {
+      statusEl.textContent = `失败：${err.message}`;
+      toast(`执行失败：${err.message}`, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("#pvPipe")?.addEventListener("click", async () => {
+    const btn = $("#pvPipe");
+    btn.disabled = true;
+      statusEl.innerHTML = '<span class="spinner"></span> 流水线：WebNovel 正在写水版…';
+      try {
+        const r = await runPipeline({
+          text: promptEl.value,
+          instruction: "按上面的完整要求写一章正文；本阶段是「水版」，请充分铺开、先求完整有料。",
+          context: {},
+        });
+        $("#pvRaw").textContent = r.final || "";
+        $("#pvResultTitle").textContent = "精简版（Gemma 浓缩）";
+        $("#pvCount").textContent = `${(r.final || "").length} 字`;
+      const wrap = $("#pvDraftWrap");
+      if (r.draft) {
+        $("#pvDraftRaw").textContent = r.draft;
+        wrap.hidden = false;
+        $("#pvCopyDraft").hidden = false;
+      } else {
+        wrap.hidden = true;
+        $("#pvCopyDraft").hidden = true;
+      }
+      $("#pvResult").hidden = false;
+      statusEl.textContent = "";
+      toast("流水线完成（精简版 + 水版），请检查后保存");
+    } catch (err) {
+      statusEl.textContent = `失败：${err.message}`;
+      toast(`流水线失败：${err.message}`, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("#pvCopyDraft")?.addEventListener("click", async () => {
+    await navigator.clipboard.writeText($("#pvDraftRaw").textContent);
+    toast("水版已复制");
+  });
+
+  $("#pvCopyResult")?.addEventListener("click", async () => {
+    await navigator.clipboard.writeText($("#pvRaw").textContent);
+    toast("结果已复制");
+  });
+
+  $("#pvSave")?.addEventListener("click", async () => {
+    const path = $("#pvPath").value.trim();
+    const content = $("#pvRaw").textContent;
+    if (!path || !content) return;
+    try {
+      await source().writeFile(path, content);
+      toast(`已保存：${path}`);
+      statusEl.textContent = `已保存 ${path}`;
+    } catch (err) {
+      toast(`保存失败：${err.message}`, true);
+    }
+  });
+
+  promptEl.focus();
+}
+
+async function copyChapterPrompt(ch, task) {
+  try {
+    toast("正在打包上下文…");
+    const prompt = await buildChapterPrompt(ch, task);
+    await navigator.clipboard.writeText(prompt);
+    toast(`已复制「${RAW_PACK_TASKS[task].name}」Prompt（${prompt.length} 字）`);
+    await openPromptRunDialog(ch, task, prompt);
+  } catch (err) {
+    toast(`打包失败：${err.message}`, true);
+  }
+}
+
+async function genChapter(ch, task) {
+  const pipeline = config.ai.usePipeline && pipelineReady();
+  if (!pipeline && !aiReady()) {
+    toast("还没有可用模型：到「设置 → AI 接口」选预设（本地 Ollama 或云端均可），或改用「复制 Prompt」", true);
+    return;
+  }
+  const box = $("#draftBox");
+  if (box) box.innerHTML = `<div class="draft-box"><div class="dh2"><span class="spinner"></span> ${pipeline ? "流水线生成中（WebNovel 水版 → Gemma 精简）…" : "生成中…"}（正文较长，请稍候）</div></div>`;
+  try {
+    if (pipeline) {
+      // 两阶段都在 11440：初稿角色 model=webnovel 写水版，浓缩角色 model=gemma 出精简版
+      const spec = await buildChapterPrompt(ch, task, { local: true });
+      const r = await runPipeline({
+        text: spec,
+        instruction: "按下面的完整要求写一章正文；本阶段是「水版」，请充分铺开、先求完整有料。",
+        context: {},
+      });
+      const text = r.final || r.draft;
+      state.draftBuffer = { ch, task, text, draft: r.draft, degraded: r.degraded };
+      renderDraftBox(ch, text, r.draft);
+      toast(r.degraded ? "精简失败，已退回水版" : "流水线完成（精简版 + 水版）");
+    } else {
+      const prompt = await buildChapterPrompt(ch, task);
+      const { candidates } = await source().aiRewrite({
+        text: prompt,
+        instruction: "按上面的完整要求执行并只输出成果本身。",
+        context: {},
+        count: 1,
+      });
+      const text = (candidates && candidates[0]) || "";
+      state.draftBuffer = { ch, task, text };
+      renderDraftBox(ch, text);
+      toast("生成完成，确认后保存");
+    }
+  } catch (err) {
+    if (box) box.innerHTML = "";
+    toast(`生成失败：${err.message}`, true);
+  }
+}
+
+function renderDraftBox(ch, text, draft) {
+  const box = $("#draftBox");
+  if (!box || !state.draftBuffer) return;
+  const taskName = RAW_PACK_TASKS[state.draftBuffer.task]?.name || "生成";
+  const draftHtml = draft
+    ? `<details class="draft-ref"><summary>查看初稿（流水线阶段一产出，仅供参考）</summary><div class="draft-raw">${escapeHtml(draft)}</div></details>`
+    : "";
+  box.innerHTML = `
+    <div class="draft-box">
+      <div class="dh2">
+        <span>${escapeHtml(taskName)}结果${state.draftBuffer.degraded ? "（浓缩失败，已退回初稿）" : ""}</span>
+        <span class="sp"></span>
+        <span id="draftCount">${text.length} 字</span>
+        <button class="mini" id="saveDraft">保存到文件</button>
+        <button class="mini" id="discardDraft">丢弃</button>
+      </div>
+      <textarea id="draftText">${escapeHtml(text)}</textarea>
+      ${draftHtml}
+    </div>`;
+  const ta = $("#draftText");
+  ta.addEventListener("input", () => {
+    const c = $("#draftCount");
+    if (c) c.textContent = `${ta.value.length} 字`;
+  });
+  $("#discardDraft").addEventListener("click", () => { box.innerHTML = ""; });
+  $("#saveDraft").addEventListener("click", async () => {
+    const { ch: c, task } = state.draftBuffer;
+    const content = ta.value;
+    const path = task === "outline"
+      ? `大纲/细纲_第${String(c.no).padStart(3, "0")}章.md`
+      : chapterFileName(c.no, c.func);
+    try {
+      await source().writeFile(path, content);
+      toast(`已保存到 ${path}`);
+      box.innerHTML = "";
+      await refreshProjectQuiet();
+      await renderWriting();
+    } catch (err) {
+      toast(`保存失败：${err.message}`, true);
+    }
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* 设置                                                                */
 /* ------------------------------------------------------------------ */
+
+/** 本地/局域网端点判断（本地模型通常不需要 Key） */
+function isLocalUrl(url) {
+  try {
+    const h = new URL(String(url)).hostname.replace(/^\[|\]$/g, "");
+    return h === "localhost" || h === "127.0.0.1" || h === "::1"
+      || /^10\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h);
+  } catch {
+    return false;
+  }
+}
+
+/** 当前配置是否可用于生成（本地端点无需 Key） */
+function aiReady() {
+  const isGh = activeMode === "github";
+  const base = (isGh ? config.ai.baseUrl : (state.aiConfig?.baseUrl || config.ai.baseUrl)) || "";
+  const model = (isGh ? config.ai.model : (state.aiConfig?.model || config.ai.model)) || "";
+  const hasKey = isGh ? Boolean(config.ai.apiKey) : Boolean(state.aiConfig?.hasKey || config.ai.apiKey);
+  return Boolean(base && model && (hasKey || isLocalUrl(base)));
+}
+
+/** 某个角色（draft / condense）是否已可用（本地端点无需 Key） */
+function roleReady(role) {
+  const isGh = activeMode === "github";
+  const r = isGh ? (config.ai.roles?.[role]) : (state.aiConfig?.roles?.[role]);
+  const base = r?.baseUrl || "";
+  const model = r?.model || "";
+  const hasKey = isGh ? Boolean(r?.apiKey) : Boolean(r?.hasKey || r?.apiKey);
+  return Boolean(base && model && (hasKey || isLocalUrl(base)));
+}
+
+/** 两阶段流水线是否可用（需同时配好初稿与浓缩两个模型） */
+function pipelineReady() { return roleReady("draft") && roleReady("condense"); }
+
+/**
+ * 流水线统一入口（全部走 11440 单端口）：
+ * 阶段一用初稿角色（model=webnovel，灌水机写水版正文）→ 阶段二用浓缩角色（model=gemma，浓缩成精简版）。
+ * 服务端按请求里的 model 字段切换后端模型，故两阶段都打同一个 11440 端口。
+ */
+async function runPipeline(payload) {
+  return source().aiPipeline(payload);
+}
+
+/** 常见服务商预设：一键填 Base URL + 常用模型名 */
+const AI_PROVIDERS = [
+  { label: "Ollama（本机 127.0.0.1）", baseUrl: "http://localhost:11434/v1", model: "qwen2.5:14b", local: true },
+  { label: "llama.cpp（局域网 PC）", baseUrl: "http://192.168.31.211:11440/v1", model: "gemma", local: true },
+  { label: "LM Studio（本地）", baseUrl: "http://localhost:1234/v1", model: "", local: true },
+  { label: "llama.cpp（本地）", baseUrl: "http://localhost:8080/v1", model: "", local: true },
+  { label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  { label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", model: "deepseek/deepseek-chat-v3" },
+  { label: "硅基流动", baseUrl: "https://api.siliconflow.cn/v1", model: "Qwen/Qwen2.5-72B-Instruct" },
+  { label: "Moonshot", baseUrl: "https://api.moonshot.cn/v1", model: "moonshot-v1-32k" },
+  { label: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
+  { label: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+];
+
+/** 渲染一个「角色模型」卡片（初稿 / 浓缩） */
+function roleCardHtml(role, title, sub, v) {
+  v = v || {};
+  return `
+  <div class="role-card" data-role="${role}">
+    <div class="role-h">${title} <span class="role-sub">${sub}</span></div>
+    <div class="chips role-presets">
+      ${AI_PROVIDERS.map((p, i) => `<button class="chip" data-role="${role}" data-aip="${i}">${escapeHtml(p.label)}</button>`).join("")}
+    </div>
+    <div class="grid2">
+      <div class="field"><label>Base URL</label><input data-f="baseUrl" placeholder="http://192.168.31.211:11434/v1" value="${escapeHtml(v.baseUrl || "")}" /></div>
+      <div class="field">
+        <label>Model <span style="font-weight:400;color:var(--text-faint)">手填，或拉取列表后从下拉选</span></label>
+        <input data-f="model" list="${role}Models" placeholder="例如 qwen2.5:32b" value="${escapeHtml(v.model || "")}" />
+        <datalist id="${role}Models"></datalist>
+        <select class="model-pick" data-f="modelPick" hidden></select>
+      </div>
+    </div>
+    <div class="field">
+      <label>API Key ${v.apiKey ? "（已保存，留空则不改动）" : "（本地地址可留空）"}</label>
+      <input data-f="apiKey" type="password" placeholder="${v.apiKey ? "••••••••" : "本地地址可留空"}" />
+    </div>
+    <div class="row">
+      <button class="btn" data-f="test">测试连接</button>
+      <button class="btn" data-f="list">拉取模型列表</button>
+      <span class="spacer"></span>
+      <span class="role-status" data-f="status" style="font-size:11.5px;color:var(--text-faint)"></span>
+    </div>
+  </div>`;
+}
 
 async function renderSettings() {
   const m = $("#main");
   const g = config.gh;
   const a = config.ai;
   const localOk = await LocalSource.ready();
-
   m.innerHTML = `
     <div class="settings">
       <h1>设置</h1>
@@ -1198,21 +2413,29 @@ async function renderSettings() {
       </div>
 
       <div class="sec">
-        <h2>AI 接口（可选）</h2>
-        <div class="grid2">
-          <div class="field"><label>Base URL</label><input id="aiBaseUrl" placeholder="https://openrouter.ai/api/v1" value="${escapeHtml(a.baseUrl)}" /></div>
-          <div class="field"><label>Model</label><input id="aiModel" placeholder="deepseek/deepseek-chat-v3" value="${escapeHtml(a.model)}" /></div>
+        <h2>AI 模型（初稿 / 浓缩 两阶段）</h2>
+        <div class="hint" style="margin-bottom:14px">
+          推理机统一在 <code>192.168.31.211:11440</code>（OpenAI 兼容）。<b>服务端按请求里的 model 字段切换后端模型</b>：
+          写水版填 <code>webnovel</code>、出精简版填 <code>gemma</code>。先点预设「llama.cpp（局域网 PC）」填好地址，再「拉取模型列表」从下拉选模型名。
+          两栏地址相同、只差模型名——填好初稿那栏后点「复制到浓缩」一键带过去。<br>
+          想用云端模型：点预设 <b>OpenRouter</b>（<code>https://openrouter.ai/api/v1</code>）+ 填 <code>sk-or-</code> 开头的 Key，「拉取模型列表」会列出全部云端模型（带上下文长度与价格），下拉直接选。本地端点 Key 可留空。
         </div>
-        <div class="field">
-          <label>API Key ${a.apiKey ? "（已保存，留空则不改动）" : ""}</label>
-          <input id="aiKey" type="password" placeholder="${a.apiKey ? "••••••••" : "sk-..."}" />
-          <div class="hint">
-            本地模式由本地服务转发，任何网关都行。<b>云端模式是浏览器直连</b>，只有放行跨域的网关可用（OpenRouter 支持）。
-            不配也能用「复制 Prompt」这条路。
-          </div>
+
+        ${roleCardHtml("draft", "① 初稿模型", "负责把要点 / 大纲展开成完整初稿", a.roles?.draft)}
+        ${roleCardHtml("condense", "② 浓缩模型", "负责把初稿浓缩、润色成最终稿", a.roles?.condense)}
+
+        <div class="row" style="margin-top:6px">
+          <label class="switch"><input type="checkbox" id="usePipelineGen" ${config.ai.usePipeline ? "checked" : ""}> 默认用「初稿 → 浓缩」流水线生成新章节</label>
         </div>
+
+        <div class="hint" style="margin-top:12px">
+          流水线两阶段都走同一个 <code>11440</code> 端口：<b>初稿</b>填 <code>webnovel</code>（灌水机，写水版正文）→ <b>浓缩</b>填 <code>gemma</code>（浓缩成精简版）。服务端按请求里的 model 字段切换后端模型。<br>
+          切换模型会触发重新加载，一次流水线（水版 + 精简）比单次调用慢，请耐心等。
+        </div>
+
         <div class="row" style="margin-top:16px">
-          <button class="btn primary" id="saveAi">保存 AI 配置</button>
+          <button class="btn primary" id="saveAi">保存配置</button>
+          <button class="btn" id="copyToOther">把「初稿」地址复制到「浓缩」</button>
           <span class="spacer"></span>
           <span style="font-size:11.5px;color:var(--text-faint)" id="aiStatus"></span>
         </div>
@@ -1282,24 +2505,114 @@ async function renderSettings() {
     renderSettings();
   });
 
+  // 每个角色卡片：预设一键填充 + 测试 + 拉取列表
+  m.querySelectorAll(".role-card").forEach((card) => {
+    const role = card.dataset.role;
+    const statusEl = () => card.querySelector('[data-f="status"]');
+    card.querySelectorAll("[data-aip]").forEach((el) => el.addEventListener("click", () => {
+      const p = AI_PROVIDERS[Number(el.dataset.aip)];
+      card.querySelector('[data-f="baseUrl"]').value = p.baseUrl;
+      const mv = card.querySelector('[data-f="model"]');
+      if (!mv.value.trim() && p.model) mv.value = p.model;
+      card.querySelectorAll("[data-aip]").forEach((x) => x.classList.remove("on"));
+      el.classList.add("on");
+      statusEl().textContent = p.local ? "本地端点 · Key 可留空" : "需要 API Key";
+    }));
+    const doList = async (fill) => {
+      const baseUrl = card.querySelector('[data-f="baseUrl"]').value.trim();
+      const apiKey = card.querySelector('[data-f="apiKey"]').value.trim();
+      if (!baseUrl) { toast("先填 Base URL", true); return; }
+      statusEl().innerHTML = '<span class="spinner"></span> 连接中…';
+      try {
+        const { models, rich, local } = await source().listModels({ baseUrl, apiKey });
+        if (fill && models.length) {
+          const items = (Array.isArray(rich) && rich.length)
+            ? rich
+            : models.map((id) => ({ id, name: "", ctx: null, price: null }));
+          const optHtml = items.map((mo) => {
+            const bits = [];
+            if (mo.ctx) bits.push(`${Math.round(mo.ctx / 1000)}k 上下文`);
+            if (mo.price != null) bits.push(`$${mo.price >= 1 ? mo.price.toFixed(2) : mo.price.toFixed(3)}/1M`);
+            const label = [mo.name || mo.id, bits.length ? `（${bits.join(" · ")}）` : ""].join(" ").trim();
+            return `<option value="${escapeHtml(mo.id)}">${escapeHtml(label)}</option>`;
+          }).join("");
+          card.querySelector(`#${role}Models`).innerHTML = optHtml;
+          const pick = card.querySelector('[data-f="modelPick"]');
+          pick.innerHTML = `<option value="">—— 从模型列表选择 ——</option>${optHtml}`;
+          pick.hidden = false;
+          const mv = card.querySelector('[data-f="model"]');
+          if (!mv.value.trim()) mv.value = models[0];
+        }
+        statusEl().textContent = models.length
+          ? `连通 · ${models.length} 个模型${local ? "（本地）" : ""}，下拉可选`
+          : "连通（未列出模型，可手填模型名）";
+        toast(models.length ? `发现 ${models.length} 个模型` : "已连通");
+      } catch (err) {
+        statusEl().textContent = "";
+        toast(`连接失败：${err.message}`, true);
+      }
+    };
+    card.querySelector('[data-f="test"]').addEventListener("click", () => doList(false));
+    card.querySelector('[data-f="list"]').addEventListener("click", () => doList(true));
+    const pickEl = card.querySelector('[data-f="modelPick"]');
+    pickEl.addEventListener("change", () => {
+      if (pickEl.value) card.querySelector('[data-f="model"]').value = pickEl.value;
+    });
+  });
+
+  // 把「初稿」栏的地址 / Key 复制到「浓缩」栏
+  // 默认用流水线生成章节（持久化到 config.ai.usePipeline）
+  $("#usePipelineGen").addEventListener("change", (e) => {
+    config.ai.usePipeline = e.target.checked;
+    saveConfig();
+    toast(e.target.checked ? "已开启流水线生成" : "已关闭流水线生成");
+  });
+
+  $("#copyToOther").addEventListener("click", () => {
+    const src = m.querySelector('.role-card[data-role="draft"] [data-f="baseUrl"]').value.trim();
+    const key = m.querySelector('.role-card[data-role="draft"] [data-f="apiKey"]').value.trim();
+    if (!src) { toast("先在「初稿」栏填好地址", true); return; }
+    m.querySelector('.role-card[data-role="condense"] [data-f="baseUrl"]').value = src;
+    const ck = m.querySelector('.role-card[data-role="condense"] [data-f="apiKey"]');
+    if (!ck.value.trim() && key) ck.value = key;
+    toast("已复制地址到「浓缩」栏");
+  });
+
   $("#saveAi").addEventListener("click", async () => {
+    const readRole = (role) => {
+      const c = m.querySelector(`.role-card[data-role="${role}"]`);
+      return {
+        baseUrl: c.querySelector('[data-f="baseUrl"]').value.trim(),
+        model: c.querySelector('[data-f="model"]').value.trim(),
+        apiKey: c.querySelector('[data-f="apiKey"]').value.trim(),
+      };
+    };
     const payload = {
-      baseUrl: $("#aiBaseUrl").value.trim(),
-      model: $("#aiModel").value.trim(),
-      apiKey: $("#aiKey").value.trim(),
+      baseUrl: state.aiConfig?.baseUrl || config.ai.baseUrl || "",
+      model: state.aiConfig?.model || config.ai.model || "",
+      apiKey: "", // 不覆盖全局 key；角色各自带自己的
+      roles: { draft: readRole("draft"), condense: readRole("condense") },
+    };
+    // 前端侧同步保存（供下次进入设置页读取）
+    config.ai.roles = payload.roles;
+    saveConfig();
+    const summarize = (cfg) => {
+      const r = cfg?.roles || {};
+      const fmt = (x) => x ? (x.hasKey || x.model ? x.model || "已配" : "未配") : "未配";
+      return `初稿：${fmt(r.draft)} ｜ 浓缩：${fmt(r.condense)}`;
     };
     if (activeMode === "local") {
       try {
         state.aiConfig = await LocalSource.saveAiConfig(payload);
         toast("AI 配置已保存");
-        $("#aiStatus").textContent = state.aiConfig.hasKey ? "已就绪" : "未配置 key";
+        $("#aiStatus").textContent = summarize(state.aiConfig);
       } catch (err) {
         toast(`保存失败：${err.message}`, true);
       }
     } else {
       state.aiConfig = await GitHubSource.saveAiConfig(payload);
       toast("AI 配置已保存到本机浏览器");
-      $("#aiStatus").textContent = state.aiConfig.hasKey ? "已就绪" : "未配置 key";
+      $("#aiStatus").textContent = summarize(state.aiConfig);
     }
   });
 }
@@ -1311,6 +2624,7 @@ async function renderSettings() {
 function setTab(view) {
   document.querySelectorAll(".tab[data-view]").forEach((el) => el.classList.toggle("on", el.dataset.view === view));
   if (view === "dash") $("#crumb").textContent = "概览";
+  if (view === "writing") $("#crumb").textContent = "写作";
   if (view === "settings") $("#crumb").textContent = "设置";
 }
 
@@ -1318,6 +2632,7 @@ async function switchView(view) {
   state.view = view;
   setTab(view);
   if (view === "dash") renderDash();
+  else if (view === "writing") await renderWriting();
   else if (view === "doc") {
     if (state.currentPath) renderDoc();
     else $("#main").innerHTML = `<div class="empty">从左侧选一个文件开始编辑</div>`;
